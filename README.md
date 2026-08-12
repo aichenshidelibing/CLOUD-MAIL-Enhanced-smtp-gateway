@@ -290,18 +290,24 @@ ss -lntp | grep 12525
 
 ## 10. Git 更新教程
 
+推荐把 Git 仓库和运行目录分开。仓库用于更新代码，运行目录保存真实的 `config.json`、`.env` 和 TLS 证书：
+
 ```bash
-cd /opt/cloud-mail-smtp-gateway
-sudo cp config.json config.json.bak.$(date +%Y%m%d%H%M%S)
+cd /root/CLOUD-MAIL-Enhanced-smtp-gateway
 git pull --ff-only
-sudo ./install.sh --dir /opt/cloud-mail-smtp-gateway --config config.json --yes
-docker compose up -d --build --force-recreate
-docker compose ps
-docker compose logs --tail=100 smtp-gateway
+sudo ./install.sh --dir /opt/cloud-mail-smtp-gateway --yes
 ```
 
-注意：`--config` 必须指向包含真实 API Key 的安全配置文件，不要用仓库中的 `config.example.json` 覆盖生产配置。
+安装脚本会保留运行目录中的真实配置和证书，并重新复制代码、构建镜像、启动容器和执行健康检查。
 
+如果要彻底重新生成配置，使用：
+
+```bash
+cd /root/CLOUD-MAIL-Enhanced-smtp-gateway
+sudo ./install.sh --dir /opt/cloud-mail-smtp-gateway --reconfigure --yes
+```
+
+注意：不要在 `/opt/cloud-mail-smtp-gateway` 中直接执行 `git pull`，除非你明确把该目录初始化成 Git 仓库。只有当配置文件来自另一个路径时才使用 `--config /path/to/config.json`；不要把 `--config` 指向安装目录中的同一个 `config.json`，也不要用仓库中的 `config.example.json` 覆盖生产配置。
 ## 11. 安全建议
 
 - 不要提交 `config.json`、`.env`、API Key、私钥或自签名证书。

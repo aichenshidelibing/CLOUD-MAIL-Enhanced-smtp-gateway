@@ -82,6 +82,8 @@ async function smtpStartTlsTest(config) {
     expectCode(await waitForResponse(raw), 250, 'EHLO before STARTTLS');
     sendCommand(raw, 'STARTTLS');
     expectCode(await waitForResponse(raw), 220, 'STARTTLS');
+    // Do not let the pre-TLS socket timeout interrupt the TLS upgrade.
+    raw.setTimeout(0);
 
     const secure = tls.connect({
       socket: raw,
