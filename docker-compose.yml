@@ -1,0 +1,27 @@
+services:
+  smtp-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloud-mail-smtp-gateway
+    user: "1000:0"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "2525:2525"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "src/cli.js", "test", "--config", "/app/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+

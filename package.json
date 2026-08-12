@@ -1,0 +1,16 @@
+{
+  "name": "cloud-mail-enhanced-smtp-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Linux Docker SMTP-to-HTTP gateway for CLOUD-MAIL-Enhanced",
+  "scripts": {
+    "start": "node src/cli.js start --config config.json",
+    "test": "node src/cli.js test --config config.json",
+    "validate": "node src/cli.js validate --config config.json"
+  },
+  "dependencies": {
+    "smtp-server": "^3.13.6"
+  }
+}
+
