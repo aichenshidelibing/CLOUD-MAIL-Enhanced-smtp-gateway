@@ -1,5 +1,10 @@
 {
-  "listen": { "host": "0.0.0.0", "port": 2525 },
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 2525,
+    "containerHost": "0.0.0.0",
+    "containerPort": 2525
+  },
   "smtp": {
     "user": "my-app",
     "password": "replace-with-cloud-mail-smtp-api-key",

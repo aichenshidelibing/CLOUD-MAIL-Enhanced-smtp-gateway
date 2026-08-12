@@ -42,8 +42,13 @@ try {
     const { checkUpstream, createServer } = await import('./server.js');
     await checkUpstream(config);
     const server = createServer(config);
-    server.listen(config.listen.port, config.listen.host, () => {
-      console.log(`SMTP gateway listening on ${config.listen.host}:${config.listen.port}`);
+    const bindHost = config.listen.containerHost || '0.0.0.0';
+    const bindPort = Number(config.listen.containerPort || 2525);
+    server.listen(bindPort, bindHost, () => {
+      console.log(
+        `SMTP gateway listening on ${bindHost}:${bindPort} ` +
+        `(published host: ${config.listen.host}:${config.listen.port})`,
+      );
     });
   } else {
     usage();
@@ -53,4 +58,3 @@ try {
   console.error(error?.message || error);
   process.exitCode = 1;
 }
-

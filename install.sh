@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# CLOUD-MAIL SMTP-to-HTTP Gateway installer.
-# Linux + Docker Compose only. It does not install Node.js or systemd.
-
 INSTALL_DIR="/opt/cloud-mail-smtp-gateway"
 CONFIG_SOURCE=""
 ASSUME_YES=0
@@ -18,8 +15,6 @@ text() {
   case "${UI_LANGUAGE}:$1" in
     zh:error) printf '错误' ;;
     en:error) printf 'ERROR' ;;
-    zh:warning) printf '警告' ;;
-    en:warning) printf 'WARNING' ;;
     zh:language_prompt) printf '语言 / Language [zh/中文]' ;;
     en:language_prompt) printf 'Language / 语言 [en/English]' ;;
     zh:language_invalid) printf '语言必须是 zh 或 en' ;;
@@ -28,16 +23,14 @@ text() {
     en:config_title) printf 'CLOUD-MAIL SMTP-to-HTTP Gateway configuration' ;;
     zh:config_hint) printf '直接按回车接受方括号中的默认值。密码和 API Key 不会回显。' ;;
     en:config_hint) printf 'Press Enter to accept the value in brackets. Passwords and API keys are hidden.' ;;
-    zh:listen_host) printf 'SMTP 监听地址' ;;
-    en:listen_host) printf 'SMTP listen host' ;;
-    zh:listen_port) printf 'SMTP 监听端口' ;;
-    en:listen_port) printf 'SMTP listen port' ;;
+    zh:listen_host) printf 'SMTP 监听地址（宿主机）' ;;
+    en:listen_host) printf 'SMTP listen host (host machine)' ;;
+    zh:listen_port) printf 'SMTP 监听端口（宿主机）' ;;
+    en:listen_port) printf 'SMTP listen port (host machine)' ;;
     zh:max_size) printf '单封邮件大小上限（字节）' ;;
     en:max_size) printf 'Maximum message size in bytes' ;;
-    zh:send_url) printf 'Cloud Mail 发信 URL' ;;
-    en:send_url) printf 'Cloud Mail send URL' ;;
-    zh:health_url) printf 'Cloud Mail 健康检查 URL' ;;
-    en:health_url) printf 'Cloud Mail health URL' ;;
+    zh:cloud_address) printf 'Cloud Mail 地址（根地址）' ;;
+    en:cloud_address) printf 'Cloud Mail address (root URL)' ;;
     zh:cloud_user) printf 'Cloud Mail SMTP 用户名' ;;
     en:cloud_user) printf 'Cloud Mail SMTP username' ;;
     zh:cloud_key) printf 'Cloud Mail SMTP API Key' ;;
@@ -50,14 +43,14 @@ text() {
     en:config_written) printf 'Configuration written to' ;;
     zh:preparing) printf '准备安装目录' ;;
     en:preparing) printf 'Preparing installation directory' ;;
+    zh:preflight) printf '在创建 Docker 容器前检查 Cloud Mail 连通性' ;;
+    en:preflight) printf 'Checking Cloud Mail connectivity before creating a Docker container' ;;
     zh:validate_compose) printf '校验 Docker Compose 配置' ;;
     en:validate_compose) printf 'Validating Docker Compose configuration' ;;
     zh:build_image) printf '构建网关镜像' ;;
     en:build_image) printf 'Building the gateway image' ;;
     zh:validate_gateway) printf '校验网关配置' ;;
     en:validate_gateway) printf 'Validating gateway configuration' ;;
-    zh:health_check) printf '检查 Cloud Mail 上游连通性' ;;
-    en:health_check) printf 'Checking Cloud Mail upstream connectivity' ;;
     zh:starting) printf '启动网关' ;;
     en:starting) printf 'Starting the gateway' ;;
     zh:waiting_health) printf '等待 Docker 健康检查' ;;
@@ -76,7 +69,7 @@ text() {
     en:replace_wizard) printf 'Existing config.json will be replaced by the configuration wizard. Continue? [y/N] ' ;;
     zh:cancelled) printf '配置替换已取消' ;;
     en:cancelled) printf 'configuration replacement cancelled' ;;
-    zh:not_started) printf '上游健康检查失败，网关未启动' ;;
+    zh:not_started) printf 'Cloud Mail 健康检查失败，网关未启动' ;;
     en:not_started) printf 'Cloud Mail upstream health check failed; the gateway was not started' ;;
     *) printf '%s' "$1" ;;
   esac
@@ -99,28 +92,25 @@ Options:
   --yes                 Do not ask before replacing an existing config.json
   -h, --help            Show this help
 
-首次安装 / First installation:
-  sudo ./install.sh
+The installer generates config.json and .env, checks Cloud Mail from the host before
+creating the gateway container, then builds and starts Docker Compose only after the
+preflight succeeds.
 
-The installer generates INSTALL_DIR/config.json on first installation. The local
-SMTP username/password are automatically the same as the Cloud Mail SMTP username/API key.
-It validates the configuration, checks upstream connectivity, builds the image,
-starts the service only after the check succeeds, and waits for a healthy container.
-
-非交互变量 / Non-interactive variables:
+Non-interactive variables:
   CLOUD_MAIL_LANGUAGE (zh or en)
   CLOUD_MAIL_LISTEN_HOST (default: 0.0.0.0)
   CLOUD_MAIL_LISTEN_PORT (default: 2525)
+  CLOUD_MAIL_ADDRESS (for example: mail.example.com or https://mail.example.com)
   CLOUD_MAIL_UPSTREAM_USER
   CLOUD_MAIL_UPSTREAM_API_KEY
-  CLOUD_MAIL_UPSTREAM_URL
-  CLOUD_MAIL_UPSTREAM_HEALTH_URL
   CLOUD_MAIL_MAX_MESSAGE_SIZE (default: 10485760)
   CLOUD_MAIL_UPSTREAM_TIMEOUT_MS (default: 15000)
 
-CLOUD_MAIL_SMTP_USER and CLOUD_MAIL_SMTP_PASSWORD are accepted as deprecated
-fallback names for compatibility, but generated local SMTP credentials always
-follow CLOUD_MAIL_UPSTREAM_USER and CLOUD_MAIL_UPSTREAM_API_KEY.
+Legacy compatibility variables:
+  CLOUD_MAIL_UPSTREAM_URL
+  CLOUD_MAIL_UPSTREAM_HEALTH_URL
+  CLOUD_MAIL_SMTP_USER
+  CLOUD_MAIL_SMTP_PASSWORD
 USAGE
 }
 
@@ -131,10 +121,6 @@ die() {
 
 info() {
   printf '\n==> %s\n' "$*"
-}
-
-warn() {
-  printf '%s: %s\n' "$(text warning)" "$*" >&2
 }
 
 set_language() {
@@ -152,8 +138,7 @@ select_language() {
   fi
   printf '%s: ' "$(text language_prompt)" >&2
   IFS= read -r value || true
-  value="${value:-zh}"
-  set_language "$value"
+  set_language "${value:-zh}"
 }
 
 require_value() {
@@ -163,8 +148,77 @@ require_value() {
   esac
 }
 
+normalize_cloud_mail_address() {
+  local value="$1"
+  value="$(printf '%s' "$value" | sed 's/[[:space:]]//g; s#/*$##')"
+  case "$value" in
+    http://*|https://*) ;;
+    *) value="https://$value" ;;
+  esac
+  printf '%s' "$value"
+}
+
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_string_values() {
+  local file="$1" key="$2"
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
+
+json_string_value() {
+  local file="$1" key="$2" mode="${3:-first}" values
+  values="$(json_string_values "$file" "$key")"
+  if [ "$mode" = last ]; then
+    printf '%s\n' "$values" | tail -n 1
+  else
+    printf '%s\n' "$values" | head -n 1
+  fi
+}
+
+json_number_value() {
+  local file="$1" key="$2"
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" \
+    | sed -E 's/.*:[[:space:]]*([0-9]+)/\1/' | head -n 1
+}
+
+write_compose_env() {
+  local config_file="$1" env_file="$2" bind_host bind_port
+  bind_host="$(json_string_value "$config_file" host)"
+  bind_port="$(json_number_value "$config_file" port)"
+  [ -n "$bind_host" ] || die 'listen.host could not be read from config.json'
+  [ -n "$bind_port" ] || die 'listen.port could not be read from config.json'
+  case "$bind_port" in *[!0-9]*|'') die 'listen.port must be an integer' ;; esac
+  umask 077
+  cat > "$env_file" <<ENV
+SMTP_BIND_HOST=$bind_host
+SMTP_PORT=$bind_port
+ENV
+  chmod 600 "$env_file"
+}
+
+check_upstream_host() {
+  local config_file="$1" response_file="$2"
+  local upstream_health_url upstream_user upstream_api_key timeout_ms timeout_seconds http_code
+  upstream_health_url="$(json_string_value "$config_file" healthUrl)"
+  upstream_user="$(json_string_value "$config_file" user last)"
+  upstream_api_key="$(json_string_value "$config_file" apiKey)"
+  timeout_ms="$(json_number_value "$config_file" timeoutMs)"
+  require_value 'upstream health URL' "$upstream_health_url"
+  require_value 'Cloud Mail SMTP username' "$upstream_user"
+  require_value 'Cloud Mail SMTP API key' "$upstream_api_key"
+  case "$timeout_ms" in *[!0-9]*|'') timeout_ms=15000 ;; esac
+  timeout_seconds=$(( (timeout_ms + 999) / 1000 ))
+  [ "$timeout_seconds" -ge 1 ] || timeout_seconds=1
+  command -v curl >/dev/null 2>&1 || die 'curl is required for the pre-container Cloud Mail health check'
+  http_code="$(curl --silent --show-error --location --connect-timeout 10 --max-time "$timeout_seconds" --user "$upstream_user:$upstream_api_key" --output "$response_file" --write-out '%{http_code}' "$upstream_health_url")" || die 'Cloud Mail upstream is not reachable'
+  case "$http_code" in
+    2??) ;;
+    *) die "Cloud Mail upstream health check returned HTTP $http_code" ;;
+  esac
+  grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$response_file" || die 'Cloud Mail upstream health check did not report ok=true'
 }
 
 prompt_value() {
@@ -190,17 +244,22 @@ prompt_secret() {
 write_config_interactive() {
   local output="$1"
   local listen_host listen_port smtp_user smtp_password max_message_size
-  local upstream_url upstream_health_url upstream_user upstream_api_key timeout_ms
-  local temporary
+  local cloud_mail_address upstream_url upstream_health_url upstream_user upstream_api_key timeout_ms temporary
 
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     listen_host="${CLOUD_MAIL_LISTEN_HOST:-0.0.0.0}"
     listen_port="${CLOUD_MAIL_LISTEN_PORT:-2525}"
+    max_message_size="${CLOUD_MAIL_MAX_MESSAGE_SIZE:-10485760}"
     upstream_user="${CLOUD_MAIL_UPSTREAM_USER:-${CLOUD_MAIL_SMTP_USER:-}}"
     upstream_api_key="${CLOUD_MAIL_UPSTREAM_API_KEY:-${CLOUD_MAIL_SMTP_PASSWORD:-}}"
-    max_message_size="${CLOUD_MAIL_MAX_MESSAGE_SIZE:-10485760}"
-    upstream_url="${CLOUD_MAIL_UPSTREAM_URL:-}"
-    upstream_health_url="${CLOUD_MAIL_UPSTREAM_HEALTH_URL:-}"
+    if [ -n "${CLOUD_MAIL_ADDRESS:-}" ]; then
+      cloud_mail_address="$(normalize_cloud_mail_address "$CLOUD_MAIL_ADDRESS")"
+      upstream_url="${cloud_mail_address}/api/smtp/send"
+      upstream_health_url="${cloud_mail_address}/api/smtp/health"
+    else
+      upstream_url="${CLOUD_MAIL_UPSTREAM_URL:-}"
+      upstream_health_url="${CLOUD_MAIL_UPSTREAM_HEALTH_URL:-}"
+    fi
     timeout_ms="${CLOUD_MAIL_UPSTREAM_TIMEOUT_MS:-15000}"
   else
     printf '\n%s\n' "$(text config_title)" >&2
@@ -208,8 +267,10 @@ write_config_interactive() {
     listen_host="$(prompt_value listen_host '0.0.0.0')"
     listen_port="$(prompt_value listen_port '2525')"
     max_message_size="$(prompt_value max_size '10485760')"
-    upstream_url="$(prompt_value send_url 'https://mail.example.com/api/smtp/send')"
-    upstream_health_url="$(prompt_value health_url 'https://mail.example.com/api/smtp/health')"
+    cloud_mail_address="$(prompt_value cloud_address 'mail.example.com')"
+    cloud_mail_address="$(normalize_cloud_mail_address "$cloud_mail_address")"
+    upstream_url="${cloud_mail_address}/api/smtp/send"
+    upstream_health_url="${cloud_mail_address}/api/smtp/health"
     upstream_user="$(prompt_value cloud_user 'my-app')"
     upstream_api_key="$(prompt_secret cloud_key)"
     timeout_ms="$(prompt_value timeout '15000')"
@@ -220,13 +281,13 @@ write_config_interactive() {
   require_value 'Cloud Mail SMTP API key' "$upstream_api_key"
   require_value 'upstream URL' "$upstream_url"
   require_value 'upstream health URL' "$upstream_health_url"
-
   smtp_user="$upstream_user"
   smtp_password="$upstream_api_key"
 
   case "$listen_port" in *[!0-9]*|'') die 'listen port must be an integer' ;; esac
   case "$max_message_size" in *[!0-9]*|'') die 'maximum message size must be an integer' ;; esac
   case "$timeout_ms" in *[!0-9]*|'') die 'upstream timeout must be an integer' ;; esac
+  [ "$listen_port" -ge 1 ] && [ "$listen_port" -le 65535 ] || die 'listen port must be 1-65535'
 
   temporary="${output}.tmp.$$"
   umask 077
@@ -234,7 +295,9 @@ write_config_interactive() {
 {
   "listen": {
     "host": "$(json_escape "$listen_host")",
-    "port": $listen_port
+    "port": $listen_port,
+    "containerHost": "0.0.0.0",
+    "containerPort": 2525
   },
   "smtp": {
     "user": "$(json_escape "$smtp_user")",
@@ -256,76 +319,35 @@ JSON
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --dir)
-      [ "$#" -ge 2 ] || die '--dir requires a directory'
-      INSTALL_DIR="$2"
-      shift 2
-      ;;
-    --config)
-      [ "$#" -ge 2 ] || die '--config requires a file'
-      CONFIG_SOURCE="$2"
-      shift 2
-      ;;
-    --reconfigure)
-      RECONFIGURE=1
-      shift
-      ;;
-    --non-interactive)
-      NON_INTERACTIVE=1
-      shift
-      ;;
-    --language|--lang)
-      [ "$#" -ge 2 ] || die '--language requires zh or en'
-      UI_LANGUAGE="$2"
-      LANGUAGE_EXPLICIT=1
-      shift 2
-      ;;
-    --yes)
-      ASSUME_YES=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      die "unknown option: $1 (use --help for usage)"
-      ;;
+    --dir) [ "$#" -ge 2 ] || die '--dir requires a directory'; INSTALL_DIR="$2"; shift 2 ;;
+    --config) [ "$#" -ge 2 ] || die '--config requires a file'; CONFIG_SOURCE="$2"; shift 2 ;;
+    --reconfigure) RECONFIGURE=1; shift ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --language|--lang) [ "$#" -ge 2 ] || die '--language requires zh or en'; UI_LANGUAGE="$2"; LANGUAGE_EXPLICIT=1; shift 2 ;;
+    --yes) ASSUME_YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (use --help for usage)" ;;
   esac
 done
 
 set_language "$UI_LANGUAGE"
 [ "$NON_INTERACTIVE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --non-interactive cannot be used together'
 [ "$RECONFIGURE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --reconfigure cannot be used together'
-
 [ "$(uname -s)" = 'Linux' ] || die 'This installer supports Linux only'
 [ "$(id -u)" -eq 0 ] || die 'Run this installer as root (for example: sudo ./install.sh)'
-
 for required in Dockerfile docker-compose.yml package.json config.example.json src; do
   [ -e "$SCRIPT_DIR/$required" ] || die "installer package is incomplete: missing $required"
 done
-
 command -v docker >/dev/null 2>&1 || die 'Docker Engine is not installed or docker is not in PATH'
 docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required (docker compose)'
+case "$INSTALL_DIR" in /*) ;; *) die 'installation directory must be an absolute path' ;; esac
+if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then die "installation path exists but is not a directory: $INSTALL_DIR"; fi
 
-case "$INSTALL_DIR" in
-  /*) ;;
-  *) die 'installation directory must be an absolute path' ;;
-esac
-
-if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
-  die "installation path exists but is not a directory: $INSTALL_DIR"
-fi
-
-if [ "$RECONFIGURE" -eq 1 ] || [ ! -f "$INSTALL_DIR/config.json" ]; then
-  select_language
-fi
-
+if [ "$RECONFIGURE" -eq 1 ] || [ ! -f "$INSTALL_DIR/config.json" ]; then select_language; fi
 info "$(text preparing): $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
-
 if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
-  for item in Dockerfile docker-compose.yml package.json .dockerignore config.example.json README.md install.sh src; do
+  for item in Dockerfile docker-compose.yml package.json .dockerignore .gitignore config.example.json README.md install.sh src; do
     [ -e "$SCRIPT_DIR/$item" ] || continue
     cp -a "$SCRIPT_DIR/$item" "$INSTALL_DIR/"
   done
@@ -336,50 +358,40 @@ if [ -n "$CONFIG_SOURCE" ]; then
   if [ -f "$INSTALL_DIR/config.json" ] && [ "$ASSUME_YES" -ne 1 ]; then
     printf "$(text replace_config)" "$INSTALL_DIR" >&2
     read -r answer
-    case "$answer" in
-      y|Y|yes|YES) ;;
-      *) die "$(text cancelled)" ;;
-    esac
+    case "$answer" in y|Y|yes|YES) ;; *) die "$(text cancelled)" ;; esac
   fi
   cp -f -- "$CONFIG_SOURCE" "$INSTALL_DIR/config.json"
 elif [ "$RECONFIGURE" -eq 1 ] || [ "$NON_INTERACTIVE" -eq 1 ] || [ ! -f "$INSTALL_DIR/config.json" ]; then
   if [ -f "$INSTALL_DIR/config.json" ] && [ "$ASSUME_YES" -ne 1 ]; then
     printf '%s' "$(text replace_wizard)" >&2
     read -r answer
-    case "$answer" in
-      y|Y|yes|YES) ;;
-      *) die "$(text cancelled)" ;;
-    esac
+    case "$answer" in y|Y|yes|YES) ;; *) die "$(text cancelled)" ;; esac
   fi
-  if [ -f "$INSTALL_DIR/config.json" ]; then
-    cp -f -- "$INSTALL_DIR/config.json" "$INSTALL_DIR/config.json.bak.$(date +%Y%m%d%H%M%S)"
-  fi
+  if [ -f "$INSTALL_DIR/config.json" ]; then cp -f -- "$INSTALL_DIR/config.json" "$INSTALL_DIR/config.json.bak.$(date +%Y%m%d%H%M%S)"; fi
   write_config_interactive "$INSTALL_DIR/config.json"
 fi
 
 [ -f "$INSTALL_DIR/config.json" ] || die "configuration file was not created: $INSTALL_DIR/config.json"
 chown root:root "$INSTALL_DIR/config.json"
 chmod 640 "$INSTALL_DIR/config.json"
+write_compose_env "$INSTALL_DIR/config.json" "$INSTALL_DIR/.env"
 cd "$INSTALL_DIR"
 
+preflight_response="$(mktemp)"
+trap 'rm -f -- "$preflight_response"' EXIT
+info "$(text preflight)"
+check_upstream_host "$INSTALL_DIR/config.json" "$preflight_response" || die "$(text not_started)"
 info "$(text validate_compose)"
 docker compose config >/dev/null || die 'docker compose config failed'
-
 info "$(text build_image)"
 docker compose build smtp-gateway || die 'Docker image build failed'
-
 info "$(text validate_gateway)"
 docker compose run --rm --no-deps smtp-gateway node src/cli.js validate --config /app/config.json || die 'gateway configuration validation failed'
-
-info "$(text health_check)"
-docker compose run --rm --no-deps smtp-gateway node src/cli.js test --config /app/config.json || die "$(text not_started)"
-
 info "$(text starting)"
 docker compose up -d --force-recreate smtp-gateway || die 'Docker Compose could not start the gateway'
 
 container_id="$(docker compose ps -q smtp-gateway)"
 [ -n "$container_id" ] || die 'gateway container was not created'
-
 info "$(text waiting_health)"
 for attempt in $(seq 1 60); do
   status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$container_id" 2>/dev/null || true)"
@@ -395,9 +407,7 @@ for attempt in $(seq 1 60); do
       docker compose logs --tail=100 smtp-gateway >&2 || true
       die "gateway Docker healthcheck failed (status: $status)"
       ;;
-    *)
-      sleep 2
-      ;;
+    *) sleep 2 ;;
   esac
 done
 

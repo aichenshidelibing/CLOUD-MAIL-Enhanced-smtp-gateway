@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "2525:2525"
+      - "${SMTP_BIND_HOST:-0.0.0.0}:${SMTP_PORT:-2525}:2525"
     volumes:
       - ./config.json:/app/config.json:ro
     read_only: true
