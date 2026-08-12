@@ -12,6 +12,7 @@ TLS_HOSTNAME="${CLOUD_MAIL_SMTP_TLS_HOSTNAME:-smtp-gateway}"
 TLS_CERT_SOURCE="${CLOUD_MAIL_SMTP_TLS_CERT_FILE:-}"
 TLS_KEY_SOURCE="${CLOUD_MAIL_SMTP_TLS_KEY_FILE:-}"
 TLS_CERT_DAYS="${CLOUD_MAIL_SMTP_TLS_DAYS:-825}"
+TLS_REGENERATE="${CLOUD_MAIL_SMTP_TLS_REGENERATE:-0}"
 [ -n "${CLOUD_MAIL_LANGUAGE:-}" ] && LANGUAGE_EXPLICIT=1
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
@@ -130,9 +131,85 @@ ENV
   chmod 600 "$env_file"
 }
 
+valid_ipv4() {
+  local ip="$1" octet
+  case "$ip" in *[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  IFS='.' read -r -a octets <<< "$ip"
+  [ "${#octets[@]}" -eq 4 ] || return 1
+  for octet in "${octets[@]}"; do
+    case "$octet" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$octet" -le 255 ] 2>/dev/null || return 1
+  done
+}
+
+append_tls_san() {
+  local current="$1" candidate="$2"
+  case ",$current," in
+    *",$candidate,"*) printf '%s' "$current" ;;
+    *) [ -n "$current" ] && current="$current,"; printf '%s%s' "$current" "$candidate" ;;
+  esac
+}
+
+collect_tls_sans() {
+  local san_list='DNS:smtp-gateway,DNS:localhost,IP:127.0.0.1' ip public_ip name endpoint
+
+  for ip in $(hostname -I 2>/dev/null || true); do
+    valid_ipv4 "$ip" || continue
+    case "$ip" in 127.*) continue ;; esac
+    san_list="$(append_tls_san "$san_list" "IP:$ip")"
+  done
+  if command -v ip >/dev/null 2>&1; then
+    while IFS= read -r ip; do
+      ip="${ip%%/*}"
+      valid_ipv4 "$ip" || continue
+      case "$ip" in 127.*) continue ;; esac
+      san_list="$(append_tls_san "$san_list" "IP:$ip")"
+    done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}')
+  fi
+
+  # hostname -I usually does not expose the public/NAT address. Try short-timeout services;
+  # if outbound access is unavailable, installation continues with local addresses.
+  if command -v curl >/dev/null 2>&1; then
+    for endpoint in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+      public_ip="$(curl -4 --silent --show-error --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)"
+      if valid_ipv4 "$public_ip"; then
+        san_list="$(append_tls_san "$san_list" "IP:$public_ip")"
+        break
+      fi
+    done
+  fi
+
+  IFS=',' read -r -a tls_names <<< "$TLS_HOSTNAME"
+  for name in "${tls_names[@]}"; do
+    name="$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -n "$name" ] || continue
+    if valid_ipv4 "$name"; then
+      san_list="$(append_tls_san "$san_list" "IP:$name")"
+    else
+      case "$name" in *[!A-Za-z0-9._-]*) die 'CLOUD_MAIL_SMTP_TLS_HOSTNAME contains an invalid DNS name or IPv4 address' ;; esac
+      san_list="$(append_tls_san "$san_list" "DNS:$name")"
+    fi
+  done
+  printf '%s' "$san_list"
+}
+
+certificate_has_sans() {
+  local cert_file="$1" required_sans="$2" san output value
+  output="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
+  [ -n "$output" ] || return 1
+  IFS=',' read -r -a required_sans_array <<< "$required_sans"
+  for san in "${required_sans_array[@]}"; do
+    case "$san" in
+      DNS:*) value="${san#DNS:}"; printf '%s' "$output" | grep -Fq "DNS:$value" || return 1 ;;
+      IP:*) value="${san#IP:}"; printf '%s' "$output" | grep -Eq "IP( Address)?:[[:space:]]*$value([,[:space:]]|$)" || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
 prepare_tls_material() {
   local tls_dir="$INSTALL_DIR/tls" cert_file="$INSTALL_DIR/tls/server.crt" key_file="$INSTALL_DIR/tls/server.key"
-  local san_list detected_ip tmp_conf tmp_key tmp_cert name
+  local san_list tmp_conf tmp_key tmp_cert name backup_stamp
   info "$(text tls_prepare)"
   mkdir -p "$tls_dir"; chmod 750 "$tls_dir"
   if [ -n "$TLS_CERT_SOURCE" ] || [ -n "$TLS_KEY_SOURCE" ]; then
@@ -141,22 +218,27 @@ prepare_tls_material() {
     [ -f "$TLS_KEY_SOURCE" ] || die "TLS private key not found: $TLS_KEY_SOURCE"
     cp -f -- "$TLS_CERT_SOURCE" "$cert_file"; cp -f -- "$TLS_KEY_SOURCE" "$key_file"
     info "$(text tls_existing): $cert_file"
-  elif [ -s "$cert_file" ] && [ -s "$key_file" ]; then
+    chown root:root "$cert_file" "$key_file"; chmod 640 "$cert_file" "$key_file"
+    return
+  fi
+
+  command -v openssl >/dev/null 2>&1 || die 'openssl is required to generate or inspect the default STARTTLS certificate'
+  case "$TLS_CERT_DAYS" in *[!0-9]*|'') die 'CLOUD_MAIL_SMTP_TLS_DAYS must be a positive integer' ;; esac
+  [ "$TLS_CERT_DAYS" -ge 1 ] || die 'CLOUD_MAIL_SMTP_TLS_DAYS must be at least 1'
+  case "$TLS_REGENERATE" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_TLS_REGENERATE must be 0 or 1' ;; esac
+
+  san_list="$(collect_tls_sans)"
+  if [ -s "$cert_file" ] && [ -s "$key_file" ] && [ "$TLS_REGENERATE" -eq 0 ] && certificate_has_sans "$cert_file" "$san_list"; then
     info "$(text tls_existing): $cert_file"
   else
-    command -v openssl >/dev/null 2>&1 || die 'openssl is required to generate the default STARTTLS certificate'
-    case "$TLS_CERT_DAYS" in *[!0-9]*|'') die 'CLOUD_MAIL_SMTP_TLS_DAYS must be a positive integer' ;; esac
-    [ "$TLS_CERT_DAYS" -ge 1 ] || die 'CLOUD_MAIL_SMTP_TLS_DAYS must be at least 1'
-    san_list='DNS:smtp-gateway,DNS:localhost,IP:127.0.0.1'
-    detected_ip="$(hostname -I 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9.]+$/ && $i !~ /^127\./) {print $i; exit}}' || true)"
-    [ -n "$detected_ip" ] && san_list="$san_list,IP:$detected_ip"
-    IFS=',' read -r -a tls_names <<< "$TLS_HOSTNAME"
-    for name in "${tls_names[@]}"; do
-      name="$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; [ -n "$name" ] || continue
-      case "$name" in *[!A-Za-z0-9._:-]*) die 'CLOUD_MAIL_SMTP_TLS_HOSTNAME contains an invalid DNS name or IP address' ;; esac
-      if printf '%s' "$name" | grep -Eq '^[0-9.]+$'; then san_list="$san_list,IP:$name"; else san_list="$san_list,DNS:$name"; fi
-    done
+    if [ -s "$cert_file" ] || [ -s "$key_file" ]; then
+      backup_stamp="$(date +%Y%m%d%H%M%S)"
+      [ -s "$cert_file" ] && cp -f -- "$cert_file" "$cert_file.bak.$backup_stamp"
+      [ -s "$key_file" ] && cp -f -- "$key_file" "$key_file.bak.$backup_stamp"
+    fi
     tmp_conf="$(mktemp)"; tmp_key="$key_file.tmp.$$"; tmp_cert="$cert_file.tmp.$$"
+    IFS=',' read -r -a tls_names <<< "$TLS_HOSTNAME"
+    name="${tls_names[0]:-smtp-gateway}"
     cat > "$tmp_conf" <<OPENSSL_CONF
 [req]
 distinguished_name = req_distinguished_name
@@ -164,15 +246,18 @@ x509_extensions = v3_req
 prompt = no
 
 [req_distinguished_name]
-CN = ${TLS_HOSTNAME%%,*}
+CN = $name
 
 [v3_req]
-subjectAltName = ${san_list}
+subjectAltName = $san_list
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
 OPENSSL_CONF
-    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days "$TLS_CERT_DAYS" -keyout "$tmp_key" -out "$tmp_cert" -config "$tmp_conf" >/dev/null 2>&1 || die 'failed to generate the STARTTLS certificate'
+    if ! openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days "$TLS_CERT_DAYS" -keyout "$tmp_key" -out "$tmp_cert" -config "$tmp_conf" >/dev/null 2>&1; then
+      rm -f -- "$tmp_conf" "$tmp_key" "$tmp_cert"
+      die 'failed to generate the STARTTLS certificate'
+    fi
     mv -f -- "$tmp_key" "$key_file"; mv -f -- "$tmp_cert" "$cert_file"; rm -f -- "$tmp_conf"
     info "$(text tls_generated): $cert_file"
   fi

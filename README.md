@@ -201,10 +201,27 @@ sudo env \
 支持的 TLS 变量：
 
 ```text
-CLOUD_MAIL_SMTP_TLS_HOSTNAME   证书 SAN，逗号分隔，默认 smtp-gateway
-CLOUD_MAIL_SMTP_TLS_CERT_FILE  已有证书文件
-CLOUD_MAIL_SMTP_TLS_KEY_FILE   已有私钥文件
-CLOUD_MAIL_SMTP_TLS_DAYS       自动证书有效期，默认 825 天
+CLOUD_MAIL_SMTP_TLS_HOSTNAME     额外的证书 DNS/IP，逗号分隔，默认 smtp-gateway
+CLOUD_MAIL_SMTP_TLS_CERT_FILE    外部证书文件；设置后不会自动覆盖证书 SAN
+CLOUD_MAIL_SMTP_TLS_KEY_FILE     外部私钥文件
+CLOUD_MAIL_SMTP_TLS_DAYS         自动证书有效期，默认 825 天
+CLOUD_MAIL_SMTP_TLS_REGENERATE   设置为 1 强制重新生成自签名证书，默认 0
+```
+
+默认自签名证书会自动把以下地址写入 Subject Alternative Name（SAN）：
+
+- `smtp-gateway`、`localhost`、`127.0.0.1`；
+- `hostname -I` 和 `ip -4 addr` 检测到的所有非回环 IPv4；
+- 安装服务器通过公网 IP 查询服务检测到的公网 IPv4（网络允许时）；
+- `CLOUD_MAIL_SMTP_TLS_HOSTNAME` 中显式指定的 DNS/IP。
+
+重新安装时，脚本会检查已有自签名证书是否包含当前自动检测到的 SAN。缺少地址时，会先生成带时间戳的 `.bak.*` 备份，再重新生成证书；已有 `config.json`、`.env` 和私钥不会因普通更新被删除。若使用 `CLOUD_MAIL_SMTP_TLS_CERT_FILE`/`CLOUD_MAIL_SMTP_TLS_KEY_FILE` 提供正式证书，脚本会原样复制，不会替换为自签名证书。
+
+如果公网 IP 没有被自动查询到，可以显式指定（示例）：
+
+```bash
+CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway,38.246.245.105' \
+  sudo ./install.sh --dir /opt/cloud-mail-smtp-gateway --yes
 ```
 
 旧变量仍兼容：`CLOUD_MAIL_UPSTREAM_URL`、`CLOUD_MAIL_UPSTREAM_HEALTH_URL`、`CLOUD_MAIL_SMTP_USER`、`CLOUD_MAIL_SMTP_PASSWORD`。
@@ -336,7 +353,17 @@ smtp-gateway:2525
 
 ### 证书验证失败
 
-测试环境信任 `/opt/cloud-mail-smtp-gateway/tls/server.crt`。生产环境更换为受信任 CA 证书，并确保客户端连接的主机名出现在证书 SAN 中。
+测试环境信任 `/opt/cloud-mail-smtp-gateway/tls/server.crt`。生产环境更换为受信任 CA 证书，并确保客户端连接的主机名或 IP 出现在证书 SAN 中。
+
+查看当前证书 SAN：
+
+```bash
+openssl x509 \
+  -in /opt/cloud-mail-smtp-gateway/tls/server.crt \
+  -noout -subject -issuer -ext subjectAltName
+```
+
+如果看到类似 `certificate is valid for 127.0.0.1 ... not 38.246.245.105`，说明旧证书是在未包含公网 IP 时生成的。先从 Git 更新安装脚本，再重新安装；脚本会自动检测并备份后重生成。也可以用上面的 `CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway,38.246.245.105'` 显式补充公网 IP。客户端连接公网 IP 时使用 STARTTLS，并将该证书加入信任库；若使用受信任 CA 证书则不需要手动信任。
 
 ### Docker 网络不存在
 
