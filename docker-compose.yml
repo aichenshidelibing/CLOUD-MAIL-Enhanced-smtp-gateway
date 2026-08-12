@@ -1,4 +1,4 @@
-services:
+﻿services:
   smtp-gateway:
     build:
       context: .
@@ -11,6 +11,11 @@ services:
       - "${SMTP_BIND_HOST:-0.0.0.0}:${SMTP_PORT:-2525}:2525"
     volumes:
       - ./config.json:/app/config.json:ro
+      - ./tls:/app/tls:ro
+    networks:
+      cloud-mail-smtp:
+        aliases:
+          - smtp-gateway
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid
@@ -25,3 +30,7 @@ services:
       start_period: 10s
       retries: 3
 
+networks:
+  cloud-mail-smtp:
+    name: cloud-mail-smtp
+    external: true

@@ -3,7 +3,18 @@ import path from 'node:path';
 
 const DEFAULTS = {
   listen: { host: '0.0.0.0', port: 2525, containerHost: '0.0.0.0', containerPort: 2525 },
-  smtp: { user: '', password: '', maxMessageSize: 10 * 1024 * 1024 },
+  smtp: {
+    user: '',
+    password: '',
+    maxMessageSize: 10 * 1024 * 1024,
+    tls: {
+      enabled: true,
+      required: true,
+      certFile: '/app/tls/server.crt',
+      keyFile: '/app/tls/server.key',
+      minVersion: 'TLSv1.2',
+    },
+  },
   upstream: { url: '', healthUrl: '', user: '', apiKey: '', timeoutMs: 15000 },
 };
 
@@ -37,6 +48,11 @@ function validateHttpsOrLocalHttp(value, field, errors) {
   }
 }
 
+function resolveConfigPath(config, value) {
+  if (!value) return '';
+  return path.isAbsolute(value) ? value : path.resolve(path.dirname(config.file), value);
+}
+
 export function validateConfig(config) {
   const errors = [];
   if (!config.listen?.host) errors.push('listen.host is required');
@@ -53,6 +69,21 @@ export function validateConfig(config) {
   if (!Number.isInteger(Number(config.smtp?.maxMessageSize)) || config.smtp.maxMessageSize < 1024) {
     errors.push('smtp.maxMessageSize must be at least 1024');
   }
+
+  const tls = config.smtp?.tls || {};
+  if (tls.enabled !== false) {
+    if (!tls.certFile) errors.push('smtp.tls.certFile is required when STARTTLS is enabled');
+    if (!tls.keyFile) errors.push('smtp.tls.keyFile is required when STARTTLS is enabled');
+    if (tls.minVersion && !['TLSv1.2', 'TLSv1.3'].includes(tls.minVersion)) {
+      errors.push('smtp.tls.minVersion must be TLSv1.2 or TLSv1.3');
+    }
+    for (const [name, value] of [['smtp.tls.certFile', tls.certFile], ['smtp.tls.keyFile', tls.keyFile]]) {
+      const resolved = resolveConfigPath(config, value);
+      if (resolved && !fs.existsSync(resolved)) errors.push(`${name} does not exist: ${resolved}`);
+      else if (resolved && !fs.statSync(resolved).isFile()) errors.push(`${name} is not a file: ${resolved}`);
+    }
+  }
+
   if (!config.upstream?.url) errors.push('upstream.url is required');
   else validateHttpsOrLocalHttp(config.upstream.url, 'upstream.url', errors);
   if (!config.upstream?.user || !config.upstream?.apiKey) errors.push('upstream.user and upstream.apiKey are required');
@@ -62,6 +93,13 @@ export function validateConfig(config) {
     errors.push('upstream.timeoutMs must be at least 1000');
   }
   return errors;
+}
+
+export function resolveTlsFiles(config) {
+  return {
+    certFile: resolveConfigPath(config, config.smtp?.tls?.certFile),
+    keyFile: resolveConfigPath(config, config.smtp?.tls?.keyFile),
+  };
 }
 
 export function healthUrl(config) {

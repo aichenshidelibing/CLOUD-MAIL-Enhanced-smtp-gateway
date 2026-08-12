@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import { SMTPServer } from 'smtp-server';
+import { resolveTlsFiles } from './config.js';
 
 function basicAuth(user, password) {
   return `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
@@ -24,13 +26,36 @@ export async function checkUpstream(config) {
   return body?.data || body;
 }
 
+function tlsOptions(config) {
+  const tls = config.smtp.tls || {};
+  if (tls.enabled === false) {
+    return {
+      disabledCommands: ['STARTTLS'],
+      allowInsecureAuth: true,
+    };
+  }
+
+  const files = resolveTlsFiles(config);
+  return {
+    secure: false,
+    key: fs.readFileSync(files.keyFile),
+    cert: fs.readFileSync(files.certFile),
+    minVersion: tls.minVersion || 'TLSv1.2',
+    allowInsecureAuth: tls.required === false,
+  };
+}
+
 export function createServer(config) {
-  return new SMTPServer({
+  const tls = config.smtp.tls || {};
+  const tlsEnabled = tls.enabled !== false;
+  const tlsRequired = tlsEnabled && tls.required !== false;
+  const server = new SMTPServer({
+    ...tlsOptions(config),
     banner: 'Cloud Mail SMTP Gateway',
-    disabledCommands: ['STARTTLS'],
     authMethods: ['PLAIN', 'LOGIN'],
     size: Number(config.smtp.maxMessageSize),
-    onAuth(auth, _session, callback) {
+    onAuth(auth, session, callback) {
+      if (tlsRequired && !session.secure) return callback(new Error('STARTTLS is required before AUTH'));
       if (auth.username !== config.smtp.user || auth.password !== config.smtp.password) return callback(new Error('Invalid SMTP credentials'));
       return callback(null, { user: auth.username });
     },
@@ -57,4 +82,6 @@ export function createServer(config) {
       });
     },
   });
+  server.on('error', (error) => console.error(`SMTP server error: ${error?.message || error}`));
+  return server;
 }

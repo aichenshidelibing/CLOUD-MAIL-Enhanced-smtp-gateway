@@ -1,35 +1,133 @@
-# CLOUD-MAIL-Enhanced SMTP-to-HTTP 网关
+# CLOUD-MAIL-Enhanced SMTP-to-HTTP Gateway
 
-这是一个 Linux + Docker Compose 网关：旧项目继续使用 SMTP，网关接收 RFC 5322/MIME 邮件后，通过 HTTPS 转发到 CLOUD-MAIL 的 SMTP HTTP API。
+一个面向 Linux + Docker 的小型 SMTP-to-HTTP 网关：业务系统通过标准 SMTP 提交邮件，网关在本地完成 SMTP AUTH 和 STARTTLS，然后通过 HTTPS + Basic Auth 调用 **CLOUD-MAIL-Enhanced** 的 SMTP HTTP API。
+
+> 本项目感谢 [CLOUD-MAIL](https://github.com/maillab/cloud-mail) 原项目作者和所有贡献者提供的开源基础，也感谢参与测试、反馈和改进建议的朋友。
+
+## 1. 工作方式
 
 ```text
-邮件客户端/旧项目 -- SMTP AUTH --> 网关 -- HTTPS + Basic Auth --> CLOUD-MAIL
+业务项目 / 业务 Docker 容器
+        │ SMTP AUTH + STARTTLS
+        ▼
+cloud-mail-smtp-gateway:2525
+        │ HTTPS + Basic Auth
+        ▼
+CLOUD-MAIL-Enhanced /api/smtp/send
 ```
 
-## 1. 重要说明
+网关默认要求：**先 STARTTLS，再 AUTH**。网关到 CLOUD-MAIL 的链路始终使用 HTTPS（只有 localhost 测试才允许 HTTP）。
 
-- 仅支持 Linux、Docker Engine 和 Docker Compose v2；不提供 Windows 安装程序。
-- 安装向导会生成真实的 `config.json`，并生成 Docker 使用的 `.env`。
-- SMTP 监听地址和端口是**宿主机发布地址**。例如填写：
-  - 地址：`127.0.0.1`
-  - 端口：`12525`
-  - 实际映射：`127.0.0.1:12525 -> 容器内 2525`
-- `127.0.0.1` 只允许本机访问；需要远程项目访问时使用服务器内网地址或 `0.0.0.0`，并配合防火墙限制来源。
-- 当前网关未实现 SMTP STARTTLS，因此旧项目中的“使用 TLS/为 SMTP 连接启用 TLS 加密”必须关闭。网关到 CLOUD-MAIL 的 HTTPS 通信仍然使用 TLS 加密。
-- Docker bridge 网络本身不是额外加密层；真正的上游传输加密来自 `https://`。
+## 2. 最重要的 Docker 连接说明
 
-## 2. CLOUD-MAIL 网页配置
+如果业务项目也是 Docker，业务容器中的 `127.0.0.1` 指向业务容器自己，不是宿主机，因此不能写：
 
-使用 CLOUD-MAIL 管理员账号登录网页，在 SMTP-to-HTTP 网关设置中：
+```text
+SMTP_HOST=127.0.0.1
+SMTP_PORT=12525
+```
 
-1. 启用 SMTP HTTP 功能；
-2. 设置默认发件账号；
-3. 设置 SMTP 用户名和 SMTP API Key；
-4. 点击测试并保存。
+### 推荐：使用共享 Docker 网络
 
-只有管理员可以读取、测试和保存 SMTP 配置；普通用户没有设置权限，接口也会拒绝非管理员请求。
+安装脚本会创建名为 `cloud-mail-smtp` 的 Docker 网络。将业务容器加入该网络：
 
-## 3. 从 Git 仓库安装
+```bash
+docker network connect cloud-mail-smtp <业务容器名>
+```
+
+然后业务项目使用：
+
+```text
+SMTP_HOST=smtp-gateway
+SMTP_PORT=2525
+SMTP_USERNAME=<CLOUD-MAIL SMTP 用户名>
+SMTP_PASSWORD=<CLOUD-MAIL SMTP API Key>
+SMTP_USE_TLS=true
+SMTP_USE_STARTTLS=true
+SMTP_TLS_MODE=starttls
+```
+
+注意：同一 Docker 网络内使用网关容器端口 `2525`，不要使用宿主机映射端口 `12525`。
+
+如果业务项目使用自己的 `docker-compose.yml`，加入：
+
+```yaml
+networks:
+  cloud-mail-smtp:
+    external: true
+
+services:
+  your-app:
+    networks:
+      - default
+      - cloud-mail-smtp
+```
+
+安装网关后，确认网络存在：
+
+```bash
+docker network inspect cloud-mail-smtp
+```
+
+### 备用：通过宿主机内网 IP
+
+如果业务容器不能加入共享网络，可以把网关监听地址设为 `0.0.0.0`，并使用宿主机内网 IP：
+
+```text
+SMTP_HOST=<宿主机内网IP>
+SMTP_PORT=12525
+```
+
+例如 `192.168.1.50:12525`。请使用防火墙只允许业务服务器访问该端口，不要直接暴露到公网。
+
+## 3. STARTTLS 和证书
+
+这是普通 SMTP + STARTTLS，不是 SMTPS/隐式 TLS：
+
+| 项目 | 设置 |
+| --- | --- |
+| SMTP 端口 | 2525（共享 Docker 网络）或安装时映射的宿主机端口 |
+| TLS 模式 | STARTTLS |
+| SMTPS/SSL 465 | 不支持，不要选择隐式 TLS |
+| AUTH | AUTH PLAIN 或 AUTH LOGIN |
+| TLS 最低版本 | TLS 1.2 |
+| AUTH 时机 | STARTTLS 成功后再认证 |
+
+安装脚本默认生成自签名证书：
+
+```text
+/opt/cloud-mail-smtp-gateway/tls/server.crt
+/opt/cloud-mail-smtp-gateway/tls/server.key
+```
+
+证书 SAN 默认包含 `smtp-gateway`、`localhost`、`127.0.0.1`，并尽量包含服务器内网 IP。也可以指定证书主机名：
+
+```bash
+sudo env CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway,mail-gateway,192.168.1.50' \
+  ./install.sh --language zh
+```
+
+生产环境建议使用受信任 CA 签发的证书和私钥：
+
+```bash
+sudo env \
+  CLOUD_MAIL_SMTP_TLS_CERT_FILE=/secure/certs/smtp-gateway.crt \
+  CLOUD_MAIL_SMTP_TLS_KEY_FILE=/secure/certs/smtp-gateway.key \
+  ./install.sh --reconfigure --yes
+```
+
+安装脚本不会在普通重新安装时覆盖已有证书。替换证书后执行：
+
+```bash
+cd /opt/cloud-mail-smtp-gateway
+docker compose restart
+```
+
+使用自签名证书时，SMTP 客户端应信任 `tls/server.crt`。测试阶段可以关闭“验证服务器证书”，但生产环境不建议关闭证书校验。业务容器使用共享网络时，TLS 主机名应填写 `smtp-gateway`。
+
+## 4. 安装
+
+仅支持 Linux + Docker Compose v2，不提供 Windows 安装程序。
 
 ```bash
 git clone https://github.com/aichenshidelibing/CLOUD-MAIL-Enhanced-smtp-gateway.git
@@ -38,111 +136,106 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
-安装脚本支持中英文：
+安装向导支持中文和英文：
 
 ```bash
 sudo ./install.sh --language zh
 sudo ./install.sh --language en
-# 或：sudo ./install.sh --lang en
 ```
 
-默认安装目录：`/opt/cloud-mail-smtp-gateway`。也可以指定：
+默认安装目录：`/opt/cloud-mail-smtp-gateway`。
 
-```bash
-sudo ./install.sh --dir /srv/cloud-mail-smtp-gateway
-```
+向导会询问：
 
-## 4. 安装向导
-
-首次运行会依次询问：
-
-1. SMTP 宿主机监听地址；
-2. SMTP 宿主机监听端口；
-3. 单封邮件大小上限；
-4. **Cloud Mail 根地址**；
-5. Cloud Mail SMTP 用户名；
-6. Cloud Mail SMTP API Key；
+1. 宿主机 SMTP 监听地址；
+2. 宿主机 SMTP 监听端口；
+3. 邮件大小上限；
+4. CLOUD-MAIL 根地址；
+5. CLOUD-MAIL SMTP 用户名；
+6. CLOUD-MAIL SMTP API Key；
 7. 请求超时时间。
 
-Cloud Mail 根地址可以填写任意一种：
+CLOUD-MAIL 地址可以写成：
 
 ```text
 mail.example.com
 https://mail.example.com
 ```
 
-脚本会自动补全协议，并自动生成：
+脚本会自动补全 `https://`，并生成 `/api/smtp/send` 与 `/api/smtp/health`。
 
-```text
-https://mail.example.com/api/smtp/send
-https://mail.example.com/api/smtp/health
-```
+本地 SMTP 用户名和密码自动跟随 CLOUD-MAIL SMTP 用户名/API Key，不会重复询问。
 
-外部 CLOUD-MAIL 地址必须使用 HTTPS；仅 localhost 测试允许 HTTP。Cloud Mail 用户名和 API Key 会同时作为本地 SMTP 网关的用户名和密码，不会再重复询问本地 SMTP 凭据。
+## 5. 安装顺序和失败行为
 
-## 5. 安装检查顺序
+脚本按以下顺序执行：
 
-安装脚本严格按以下顺序执行：
+1. 检查 Linux、Docker、Docker Compose、curl 和 openssl；
+2. 复制网关文件；
+3. 生成或保留 STARTTLS 证书；
+4. 生成 `config.json` 和 `.env`；
+5. 在创建网关容器前，由宿主机 curl 检查 CLOUD-MAIL 健康接口；
+6. 健康接口必须返回 2xx 且响应包含 `ok=true`，否则立即退出，不创建或启动网关容器；
+7. 创建共享 Docker 网络并校验 Compose；
+8. 构建镜像；
+9. 在容器创建前完成配置文件静态校验；
+10. 启动网关并等待 Docker healthcheck 为 `healthy`；
+11. 安装完成前执行真实 SMTP TCP 连接、STARTTLS 握手和 AUTH PLAIN 验证。
 
-1. 检查 Linux、Docker 和 Docker Compose；
-2. 生成 `config.json`；
-3. 根据 `listen.host` 和 `listen.port` 生成 `.env`，确保端口设置实际生效；
-4. **在创建或启动 Docker 网关容器之前**，使用宿主机 `curl` 访问 Cloud Mail 健康检查 URL；
-5. 校验 HTTP 状态码并确认响应包含 `ok=true`；
-6. 预检查失败时立即退出，不构建、不启动网关容器；
-7. 预检查成功后校验 Compose、构建镜像并启动容器；
-8. 启动后等待 Docker healthcheck 变为 `healthy`。
-
-健康检查会使用 Cloud Mail SMTP 用户名/API Key 认证，但不会发送真实邮件。
+因此，如果 CLOUD-MAIL 地址、账号、API Key 或证书配置不正确，安装不会显示成功。
 
 ## 6. 非交互安装
-
-推荐使用一个 Cloud Mail 根地址：
 
 ```bash
 sudo env \
   CLOUD_MAIL_LANGUAGE=en \
-  CLOUD_MAIL_LISTEN_HOST=127.0.0.1 \
+  CLOUD_MAIL_LISTEN_HOST=0.0.0.0 \
   CLOUD_MAIL_LISTEN_PORT=12525 \
   CLOUD_MAIL_ADDRESS=https://mail.example.com \
   CLOUD_MAIL_UPSTREAM_USER=my-app \
   CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
+  CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway' \
   ./install.sh --non-interactive --yes
 ```
 
-旧版变量仍兼容：
+支持的 TLS 变量：
 
 ```text
-CLOUD_MAIL_UPSTREAM_URL
-CLOUD_MAIL_UPSTREAM_HEALTH_URL
-CLOUD_MAIL_SMTP_USER
-CLOUD_MAIL_SMTP_PASSWORD
+CLOUD_MAIL_SMTP_TLS_HOSTNAME   证书 SAN，逗号分隔，默认 smtp-gateway
+CLOUD_MAIL_SMTP_TLS_CERT_FILE  已有证书文件
+CLOUD_MAIL_SMTP_TLS_KEY_FILE   已有私钥文件
+CLOUD_MAIL_SMTP_TLS_DAYS       自动证书有效期，默认 825 天
 ```
+
+旧变量仍兼容：`CLOUD_MAIL_UPSTREAM_URL`、`CLOUD_MAIL_UPSTREAM_HEALTH_URL`、`CLOUD_MAIL_SMTP_USER`、`CLOUD_MAIL_SMTP_PASSWORD`。
 
 ## 7. 配置文件和端口映射
 
-安装目录中的关键文件：
+安装目录中的重要文件：
 
 ```text
-config.json  # 真实配置，包含 API Key，不提交 Git
-.env         # Docker 端口映射，不提交 Git
+config.json                 # 真实配置，含 API Key，不提交 Git
+.env                        # 宿主机端口映射，不提交 Git
+tls/server.crt              # STARTTLS 证书，不提交 Git
+tls/server.key              # STARTTLS 私钥，不提交 Git
 docker-compose.yml
 ```
 
-示例配置：
+如果向导输入：
 
-```json
-{
-  "listen": {
-    "host": "127.0.0.1",
-    "port": 12525,
-    "containerHost": "0.0.0.0",
-    "containerPort": 2525
-  }
-}
+```text
+SMTP 监听地址：127.0.0.1
+SMTP 监听端口：12525
 ```
 
-`listen.host` 和 `listen.port` 控制宿主机映射；容器内部固定监听 `0.0.0.0:2525`。因此改完向导中的地址和端口后，脚本会把它们写入 `.env`，Compose 不会再回到默认的 `0.0.0.0:2525`。
+`.env` 会写成：
+
+```dotenv
+SMTP_BIND_HOST=127.0.0.1
+SMTP_PORT=12525
+```
+
+这只控制宿主机映射；容器内部始终监听 `0.0.0.0:2525`。业务 Docker 容器若加入共享网络，直接使用 `smtp-gateway:2525`，不受宿主机映射影响。
 
 ## 8. 管理命令
 
@@ -162,43 +255,40 @@ docker compose down
 sudo ./install.sh --reconfigure
 ```
 
-脚本会先备份旧的 `config.json`。配置或代码更新后：
+脚本会备份原有 `config.json`。代码或配置更新后：
 
 ```bash
 docker compose up -d --build --force-recreate
 ```
 
-## 9. 手工验证
+## 9. 手工检查
 
-安装脚本已自动完成宿主机预检查。容器启动后可以手工验证：
+检查上游：
 
 ```bash
-docker compose run --rm --no-deps smtp-gateway node src/cli.js validate --config /app/config.json
 docker compose run --rm --no-deps smtp-gateway node src/cli.js test --config /app/config.json
 ```
 
-## 10. SMTP 客户端配置
+检查配置：
 
-| 项目 | 设置 |
-| --- | --- |
-| SMTP 主机 | 网关所在 Linux 服务器地址 |
-| SMTP 端口 | 安装时填写的宿主机端口，例如 `12525` |
-| 用户名 | Cloud Mail SMTP 用户名 |
-| 密码 | Cloud Mail SMTP API Key |
-| 认证 | AUTH PLAIN 或 AUTH LOGIN |
-| 使用 TLS | **关闭** |
+```bash
+docker compose run --rm --no-deps smtp-gateway node src/cli.js validate --config /app/config.json
+```
 
-关闭“使用 TLS”只针对客户端到本地 SMTP 网关这一段。网关到 CLOUD-MAIL 的请求仍然使用 HTTPS/TLS。若需要公网 SMTP，请在网关前增加支持 TLS 的 SMTP 代理或反向代理，不要直接暴露当前 2525 端口。
+检查 STARTTLS 和 AUTH：
 
-## 11. 安全建议
+```bash
+docker compose exec -T smtp-gateway node src/cli.js smtp-test --config /app/config.json
+```
 
-- 不要把真实 `config.json`、`.env` 或 API Key 提交到 Git。
-- 让 `config.json` 只允许 root 或网关服务账号读取。
-- 使用防火墙限制 SMTP 来源 IP。
-- CLOUD-MAIL 使用正式 HTTPS 证书、正确 DNS 和有效 CA 链。
-- API Key 泄露后立即在 CLOUD-MAIL 管理员页面撤销并重新生成。
+查看端口：
 
-## 12. Git 升级教程
+```bash
+docker compose port smtp-gateway 2525
+ss -lntp | grep 12525
+```
+
+## 10. Git 更新教程
 
 ```bash
 cd /opt/cloud-mail-smtp-gateway
@@ -210,8 +300,46 @@ docker compose ps
 docker compose logs --tail=100 smtp-gateway
 ```
 
-如果使用 `--config`，请确保指定的是包含真实配置的安全文件；不要用仓库中的 `config.example.json` 覆盖真实配置。
+注意：`--config` 必须指向包含真实 API Key 的安全配置文件，不要用仓库中的 `config.example.json` 覆盖生产配置。
+
+## 11. 安全建议
+
+- 不要提交 `config.json`、`.env`、API Key、私钥或自签名证书。
+- `config.json` 和私钥仅允许 root/网关服务账号读取。
+- Docker bridge 网络本身不是加密层；STARTTLS 才负责 SMTP 链路加密。
+- 仅允许可信业务容器或内网 IP 访问 SMTP 端口。
+- 不要把 2525/12525 直接暴露到公网。
+- CLOUD-MAIL 必须使用有效 HTTPS 证书；API Key 泄露后应立即在管理员页面撤销并重新生成。
+- 生产环境使用受信任 CA 证书，客户端开启服务器证书校验。
+
+## 12. 故障排查
+
+### `dial tcp 127.0.0.1:12525: connect: connection refused`
+
+这是因为调用方在 Docker 容器中，`127.0.0.1` 指向调用方容器自身。将调用方加入 `cloud-mail-smtp` 网络并改用：
+
+```text
+smtp-gateway:2525
+```
+
+或者改用宿主机内网 IP + `12525`。
+
+### `STARTTLS is required before AUTH`
+
+客户端没有启用 STARTTLS，或选择了错误的 SMTPS/SSL 模式。请使用普通 SMTP 端口，并打开 STARTTLS。
+
+### 证书验证失败
+
+测试环境信任 `/opt/cloud-mail-smtp-gateway/tls/server.crt`。生产环境更换为受信任 CA 证书，并确保客户端连接的主机名出现在证书 SAN 中。
+
+### Docker 网络不存在
+
+重新运行安装脚本；脚本会自动创建 external network：
+
+```bash
+sudo ./install.sh --reconfigure --yes
+```
 
 ## 感谢
 
-感谢 CLOUD-MAIL 原项目作者和社区贡献者提供的开源基础，也感谢所有参与测试、反馈问题和提出改进建议的朋友。
+感谢 CLOUD-MAIL 原项目作者、社区贡献者、测试人员和所有提供问题反馈的朋友。
