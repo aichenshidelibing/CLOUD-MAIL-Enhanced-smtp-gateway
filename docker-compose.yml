@@ -16,6 +16,7 @@
       cloud-mail-smtp:
         aliases:
           - smtp-gateway
+          - "${SMTP_TLS_DOMAIN:-smtp-gateway}"
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid

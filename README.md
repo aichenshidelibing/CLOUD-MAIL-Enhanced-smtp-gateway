@@ -123,7 +123,64 @@ cd /opt/cloud-mail-smtp-gateway
 docker compose restart
 ```
 
-使用自签名证书时，SMTP 客户端应信任 `tls/server.crt`。测试阶段可以关闭“验证服务器证书”，但生产环境不建议关闭证书校验。业务容器使用共享网络时，TLS 主机名应填写 `smtp-gateway`。
+使用自签名证书时，SMTP 客户端应信任 `tls/server.crt`。测试阶段可以关闭“验证服务器证书”，但生产环境不建议关闭证书校验。业务容器使用共享网络且未启用 Let’s Encrypt 时，TLS 主机名应填写 `smtp-gateway`；启用 Let’s Encrypt 后应填写证书域名。
+
+## Let’s Encrypt：域名绑定、自动申请与自动续签
+
+生产环境推荐使用一个专用 SMTP 域名，例如 `smtp.example.com`。在运行安装脚本前，请完成：
+
+1. 在 DNS 服务商处创建 `A` 记录：`smtp.example.com -> 服务器公网 IPv4`；
+2. 确认服务器安全组和防火墙允许 TCP `80`（首次申请使用 HTTP-01）以及你的 SMTP 端口；
+3. 确认 TCP 80 没有被 Nginx、Apache 或其他程序占用。脚本会在申请前检查 DNS 和端口；
+4. 使用域名连接 SMTP，不要用公网 IP：证书只对域名有效。
+
+交互式安装时，填写 SMTP TLS 域名后选择自动申请，并填写邮箱。非交互式安装：
+
+```bash
+sudo env \
+  CLOUD_MAIL_LANGUAGE=zh \
+  CLOUD_MAIL_LISTEN_HOST=0.0.0.0 \
+  CLOUD_MAIL_LISTEN_PORT=12525 \
+  CLOUD_MAIL_ADDRESS=https://mail.example.com \
+  CLOUD_MAIL_UPSTREAM_USER=my-app \
+  CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
+  CLOUD_MAIL_SMTP_TLS_DOMAIN=smtp.example.com \
+  CLOUD_MAIL_SMTP_LETSENCRYPT=1 \
+  CLOUD_MAIL_SMTP_LETSENCRYPT_EMAIL=admin@example.com \
+  ./install.sh --non-interactive --yes
+```
+
+也可以使用命令行参数：
+
+```bash
+sudo ./install.sh --domain smtp.example.com \
+  --letsencrypt --letsencrypt-email admin@example.com --yes
+```
+
+脚本会自动完成：
+
+- 安装 `certbot`（Debian/Ubuntu 使用 `apt-get`；其他发行版请预装 certbot）；
+- 使用 Certbot standalone HTTP-01 申请证书；申请前检查域名解析到本服务器，并拒绝在 TCP 80 已被占用时继续；
+- 将 `fullchain.pem` 和 `privkey.pem` 安全复制到安装目录的 `tls/`；
+- 创建 Certbot deploy hook，续签成功后自动复制新证书并重启 `smtp-gateway`；
+- 优先启用发行版提供的 `certbot.timer`，否则写入 `/etc/cron.d/cloud-mail-smtp-gateway-certbot` 作为续签计划。
+
+默认使用 Let’s Encrypt 正式环境。首次调试 DNS 时可先加：
+
+```bash
+CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING=1
+```
+
+注意：HTTP-01 申请/续签必须能从公网访问 TCP 80。如果 80 端口必须由现有 Web 服务长期占用，应改用 DNS-01，或使用反向代理/Certbot webroot 方案；当前脚本不会强行停止现有 Web 服务。Let’s Encrypt 证书通常约 90 天有效，Certbot 会在合适的时间自动续签。
+
+续签检查：
+
+```bash
+sudo certbot renew --dry-run
+sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/cloud-mail-smtp-gateway
+```
+
+SMTP 客户端设置：`smtp.example.com` + 宿主机映射端口（如 `12525`）+ **普通 SMTP/STARTTLS**，不要选择 SMTPS/SSL 465。加入共享 Docker 网络的业务容器建议使用你的 Let’s Encrypt 域名（例如 `smtp.example.com:2525`），安装脚本会把该域名加入网关容器别名，因此容器内也能通过该域名访问并完成证书校验；未启用 Let’s Encrypt 时才使用 `smtp-gateway:2525`。
 
 ## 4. 安装
 
@@ -364,6 +421,37 @@ openssl x509 \
 ```
 
 如果看到类似 `certificate is valid for 127.0.0.1 ... not 38.246.245.105`，说明旧证书是在未包含公网 IP 时生成的。先从 Git 更新安装脚本，再重新安装；脚本会自动检测并备份后重生成。也可以用上面的 `CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway,38.246.245.105'` 显式补充公网 IP。客户端连接公网 IP 时使用 STARTTLS，并将该证书加入信任库；若使用受信任 CA 证书则不需要手动信任。
+如果错误变为：
+
+```text
+x509: certificate signed by unknown authority
+```
+
+这表示客户端已经连接到网关，但不信任网关使用的自签名证书。这不是 SAN/IP 错误，不能仅靠再次生成证书解决。二选一：
+
+1. **测试/内网环境**：在 SMTP 客户端关闭“验证服务器证书”或设置跳过证书校验。必须仍然选择普通 SMTP + STARTTLS，不要选择 SMTPS/SSL。
+2. **推荐方式**：把网关证书复制到业务容器并加入系统信任库。业务容器中可以这样处理：
+
+```yaml
+volumes:
+  - /opt/cloud-mail-smtp-gateway/tls/server.crt:/usr/local/share/ca-certificates/cloud-mail-smtp-gateway.crt:ro
+```
+
+然后在业务容器镜像中执行：
+
+```dockerfile
+RUN update-ca-certificates
+```
+
+如果业务程序使用自定义 CA 文件，则将 `/usr/local/share/ca-certificates/cloud-mail-smtp-gateway.crt` 配置为 `SSL_CERT_FILE`、`REQUESTS_CA_BUNDLE` 或该程序对应的 CA 配置。Go 程序应把该证书加入 `x509.CertPool`，不要在生产环境长期使用 `InsecureSkipVerify`。
+
+网关自身的安装健康检查已经使用临时的不验证模式来验证 STARTTLS 和 AUTH，因此下面的命令不应因自签名证书报 `unknown authority`：
+
+```bash
+docker compose exec -T smtp-gateway node src/cli.js smtp-test --config /app/config.json
+```
+
+如果这条命令通过，而你的业务程序仍报 `unknown authority`，问题就在业务程序的 CA 信任库，需要按上面方式导入证书。
 
 ### Docker 网络不存在
 
