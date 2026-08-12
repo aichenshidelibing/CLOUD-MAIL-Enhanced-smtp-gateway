@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 import net from 'node:net';
 import tls from 'node:tls';
 import { loadConfig, validateConfig, healthUrl } from './config.js';
@@ -93,7 +93,6 @@ async function smtpStartTlsTest(config) {
       secure.once('secureConnect', resolve);
       secure.once('error', reject);
     });
-    expectCode(await waitForResponse(secure), 220, 'SMTP greeting after TLS');
     sendCommand(secure, 'EHLO cloud-mail-healthcheck');
     expectCode(await waitForResponse(secure), 250, 'EHLO after STARTTLS');
     const auth = Buffer.from(`\u0000${config.smtp.user}\u0000${config.smtp.password}`).toString('base64');
