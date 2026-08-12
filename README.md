@@ -66,12 +66,28 @@ docker compose version
 发信接口： https://mail.example.com/api/smtp/send
 ```
 
-网关的 `upstream.user` 必须与 Cloud Mail 网页中的 SMTP 用户名一致，`upstream.apiKey` 使用同一个 SMTP API Key。不要把本地 SMTP 密码和 Cloud Mail API Key 设置成同一个值。
+网关的 `upstream.user` 必须与 Cloud Mail 网页中的 SMTP 用户名一致，`upstream.apiKey` 使用同一个 SMTP API Key。安装向导会让本地 SMTP 的 `smtp.user` 自动等于 `upstream.user`，让本地 SMTP 的 `smtp.password` 自动等于 `upstream.apiKey`，因此旧项目只需要使用 Cloud Mail 设置中的这组用户名和 API Key。
 
 ## 四、从 Git 仓库安装和配置网关
 
 安装脚本只适用于 Linux，并且要求已经安装 Docker Engine 和 Docker Compose v2。它不会安装 Node.js，也不会创建 systemd 服务。
 
+### 0. 安装脚本语言
+
+安装脚本支持中文和英文界面，默认使用中文。可以通过命令行切换：
+
+```bash
+sudo ./install.sh --language zh
+sudo ./install.sh --language en
+```
+
+也可以使用别名 `--lang en`，或设置环境变量：
+
+```bash
+CLOUD_MAIL_LANGUAGE=en sudo ./install.sh
+```
+
+首次交互式安装不指定语言时，脚本会先询问 `zh/中文` 或 `en/English`。
 ### 1. 从 GitHub 获取项目
 
 ```bash
@@ -91,13 +107,12 @@ sudo ./install.sh
 首次执行时，脚本会进入配置向导并依次询问：
 
 - SMTP 监听地址和端口；
-- 旧项目连接网关时使用的 SMTP 用户名和密码；
 - 单封邮件大小上限；
 - Cloud Mail 发信 URL 和健康检查 URL；
-- Cloud Mail SMTP HTTP 用户名和 API Key；
+- Cloud Mail SMTP 用户名和 API Key；本地 SMTP 用户名和密码会自动跟随这两项，不再重复询问；
 - 上游请求超时时间。
 
-密码和 API Key 输入时不会回显。向导完成后会自动生成安装目录中的真实配置文件：
+API Key 输入时不会回显。向导完成后会自动生成安装目录中的真实配置文件。生成规则是：`smtp.user = upstream.user`，`smtp.password = upstream.apiKey`：
 
 ```text
 /opt/cloud-mail-smtp-gateway/config.json
@@ -134,16 +149,14 @@ sudo ./install.sh --reconfigure
 
 ```bash
 sudo env \
-  CLOUD_MAIL_SMTP_USER='legacy-app' \
-  CLOUD_MAIL_SMTP_PASSWORD='change-me-local' \
+  CLOUD_MAIL_UPSTREAM_USER='my-app' \
+  CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
   CLOUD_MAIL_UPSTREAM_URL='https://mail.example.com/api/smtp/send' \
   CLOUD_MAIL_UPSTREAM_HEALTH_URL='https://mail.example.com/api/smtp/health' \
-  CLOUD_MAIL_UPSTREAM_USER='smtp-client' \
-  CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
   ./install.sh --non-interactive --yes
 ```
 
-非交互模式的必填变量是 `CLOUD_MAIL_SMTP_USER`、`CLOUD_MAIL_SMTP_PASSWORD`、`CLOUD_MAIL_UPSTREAM_URL`、`CLOUD_MAIL_UPSTREAM_HEALTH_URL`、`CLOUD_MAIL_UPSTREAM_USER` 和 `CLOUD_MAIL_UPSTREAM_API_KEY`。监听地址、端口、邮件大小和超时时间有默认值。
+非交互模式的必填变量是 `CLOUD_MAIL_UPSTREAM_URL`、`CLOUD_MAIL_UPSTREAM_HEALTH_URL`、`CLOUD_MAIL_UPSTREAM_USER` 和 `CLOUD_MAIL_UPSTREAM_API_KEY`。监听地址、端口、邮件大小、超时时间和语言有默认值。旧版的 `CLOUD_MAIL_SMTP_USER`、`CLOUD_MAIL_SMTP_PASSWORD` 仍可作为兼容性回退变量，但生成的本地 SMTP 凭据始终以 Cloud Mail 的用户名和 API Key 为准。
 
 ### 4. 使用已有配置文件安装
 
@@ -248,8 +261,8 @@ sudo docker compose up -d --force-recreate smtp-gateway
 | --- | --- |
 | `listen.host` | 容器内监听地址，通常保持 `0.0.0.0`。 |
 | `listen.port` | 容器内 SMTP 端口，默认 `2525`。不要改成 25，除非你明确了解 Linux 特权端口和 Docker 权限。 |
-| `smtp.user` | 旧项目连接网关时使用的 SMTP 用户名。 |
-| `smtp.password` | 旧项目连接网关时使用的本地 SMTP 密码；不是 Cloud Mail API Key。 |
+| `smtp.user` | 自动等于 `upstream.user`，旧项目连接网关时使用的 SMTP 用户名。 |
+| `smtp.password` | 自动等于 `upstream.apiKey`；旧项目连接网关时使用的 SMTP 密码实际上就是 Cloud Mail SMTP API Key。 |
 | `smtp.maxMessageSize` | 单封邮件上限，默认 10 MiB，至少 1024 字节。 |
 | `upstream.url` | Cloud Mail 的发信 API，必须是 HTTPS；仅允许 localhost 测试时使用 HTTP。 |
 | `upstream.healthUrl` | Cloud Mail 的健康检查 API。 |
@@ -342,10 +355,10 @@ Compose 已配置 `restart: unless-stopped`、以容器 UID 1000/GID 0 运行、
 | SMTP 端口 | `2525`（如果修改了 Compose 端口映射，以实际映射为准） |
 | 用户名 | `config.json` 中的 `smtp.user` |
 | 密码 | `config.json` 中的 `smtp.password` |
-| 加密 | 当前网关默认不提供 STARTTLS |
+| 加密 | 当前网关默认不提供 STARTTLS，客户端不要勾选“使用 TLS” |
 | 认证 | AUTH PLAIN 或 AUTH LOGIN |
 
-如果旧程序强制要求 TLS，请不要直接把它连接到当前 2525 端口；应在网关前增加 TLS SMTP 代理，或者等待后续实现 STARTTLS。
+如果旧程序或邮件客户端有“使用 TLS / 为 SMTP 连接启用 TLS 加密”选项，当前版本请关闭该选项，并使用可信内网、VPN 或 TLS 反向代理保护 2525 端口。当前 `src/server.js` 明确禁用了 `STARTTLS`；直接开启客户端 TLS 会导致连接失败。不要把 2525 端口暴露到公网。
 
 ## 八、安全建议
 
@@ -358,7 +371,7 @@ chmod 640 config.json`，并限制服务器上可以读取该文件的用户。
 6. 通过 HTTPS 访问 Cloud Mail，确认服务器时间、CA 证书和 DNS 正常。
 7. 定期查看 `docker compose logs`，关注认证失败、上游失败和异常流量。
 8. 不要把含有真实密钥的 `config.json` 放入镜像、Git 仓库或备份公开目录。
-9. 当前没有 STARTTLS，邮件内容在网关与 SMTP 客户端之间不是加密传输；生产环境应使用 TLS 网络或可信内网。
+9. 当前没有 STARTTLS；如果客户端有“使用 TLS”选项必须关闭。生产环境应使用可信内网、VPN，或在网关前增加支持 TLS 的 SMTP 代理。
 
 ## 九、常见问题
 

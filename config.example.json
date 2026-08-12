@@ -1,15 +1,15 @@
-﻿{
+{
   "listen": { "host": "0.0.0.0", "port": 2525 },
   "smtp": {
     "user": "my-app",
-    "password": "change-me-local",
+    "password": "replace-with-cloud-mail-smtp-api-key",
     "maxMessageSize": 10485760
   },
   "upstream": {
     "url": "https://mail.example.com/api/smtp/send",
     "healthUrl": "https://mail.example.com/api/smtp/health",
     "user": "my-app",
-    "apiKey": "change-me-cloud-mail-api-key",
+    "apiKey": "replace-with-cloud-mail-smtp-api-key",
     "timeoutMs": 15000
   }
 }
