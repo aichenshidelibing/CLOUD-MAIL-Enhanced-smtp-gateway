@@ -6,7 +6,7 @@
 旧项目 / 邮件客户端 -- SMTP AUTH --> smtp-gateway -- HTTPS + Basic Auth --> Cloud Mail Worker
 ```
 
-> **部署范围**：网关只支持 Linux + Docker Engine + Docker Compose。提供的 `install.sh` 只负责复制配置、构建 Docker 镜像、执行上游健康检查并启动 Compose 服务；它不会安装 Node.js、systemd 或其他宿主机服务。
+> **部署范围**：网关只支持 Linux + Docker Engine + Docker Compose。提供的 `install.sh` 会在首次安装时通过交互式向导生成真实的 `config.json`，然后执行配置校验、上游健康检查、Docker 构建和 Compose 启动；它不会安装 Node.js、systemd 或其他宿主机服务。
 
 ## 一、功能和限制
 
@@ -68,61 +68,95 @@ docker compose version
 
 网关的 `upstream.user` 必须与 Cloud Mail 网页中的 SMTP 用户名一致，`upstream.apiKey` 使用同一个 SMTP API Key。不要把本地 SMTP 密码和 Cloud Mail API Key 设置成同一个值。
 
-## 四、使用安装脚本部署网关
+## 四、从 Git 仓库安装和配置网关
 
-安装脚本只适用于 Linux，并且要求已经安装 Docker Engine 和 Docker Compose v2。脚本不会安装 Node.js，也不会创建 systemd 服务。
+安装脚本只适用于 Linux，并且要求已经安装 Docker Engine 和 Docker Compose v2。它不会安装 Node.js，也不会创建 systemd 服务。
 
-先把 `smtp-gateway` 目录复制到 Linux 服务器，然后进入目录：
+### 1. 从 GitHub 获取项目
 
 ```bash
-cd smtp-gateway
+git clone https://github.com/aichenshidelibing/CLOUD-MAIL-Enhanced-smtp-gateway.git
+cd CLOUD-MAIL-Enhanced-smtp-gateway
 chmod +x install.sh
 ```
 
-### 方式 A：先准备配置，再执行安装
+如果服务器无法直接访问 GitHub，也可以在可联网机器下载项目后，把整个目录复制到 Linux 服务器。
+
+### 2. 首次安装：脚本自动生成真实配置
 
 ```bash
-cp config.example.json config.json
-sudo chown root:root config.json
-chmod 640 config.json
-vi config.json
 sudo ./install.sh
 ```
 
-### 方式 B：让脚本从指定文件复制配置
+首次执行时，脚本会进入配置向导并依次询问：
+
+- SMTP 监听地址和端口；
+- 旧项目连接网关时使用的 SMTP 用户名和密码；
+- 单封邮件大小上限；
+- Cloud Mail 发信 URL 和健康检查 URL；
+- Cloud Mail SMTP HTTP 用户名和 API Key；
+- 上游请求超时时间。
+
+密码和 API Key 输入时不会回显。向导完成后会自动生成安装目录中的真实配置文件：
+
+```text
+/opt/cloud-mail-smtp-gateway/config.json
+```
+
+不需要手工复制 `config.example.json`，也不要把真实 `config.json` 提交到 Git。脚本写入配置后会依次执行：
+
+1. 检查 Linux、Docker Engine 和 Docker Compose v2；
+2. 校验 Compose 配置；
+3. 构建 Docker 镜像；
+4. 校验 `config.json` 格式和字段；
+5. 调用 Cloud Mail 健康检查接口验证上游连通、认证和发信配置；
+6. 只有上述检查全部成功，才启动 SMTP 网关；
+7. 启动后等待 Docker healthcheck 变成 `healthy`。
+
+如果上游连接、认证或健康检查失败，脚本会退出并且不会启动网关。
+
+默认安装目录是 `/opt/cloud-mail-smtp-gateway`，可以使用 `--dir` 修改：
+
+```bash
+sudo ./install.sh --dir /srv/cloud-mail-smtp-gateway
+```
+
+### 3. 重新配置
+
+重新配置前，脚本会自动备份旧文件，例如 `config.json.bak.20260812093000`：
+
+```bash
+cd /opt/cloud-mail-smtp-gateway
+sudo ./install.sh --reconfigure
+```
+
+也可以在自动化部署中使用环境变量，不进入交互向导：
+
+```bash
+sudo env \
+  CLOUD_MAIL_SMTP_USER='legacy-app' \
+  CLOUD_MAIL_SMTP_PASSWORD='change-me-local' \
+  CLOUD_MAIL_UPSTREAM_URL='https://mail.example.com/api/smtp/send' \
+  CLOUD_MAIL_UPSTREAM_HEALTH_URL='https://mail.example.com/api/smtp/health' \
+  CLOUD_MAIL_UPSTREAM_USER='smtp-client' \
+  CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
+  ./install.sh --non-interactive --yes
+```
+
+非交互模式的必填变量是 `CLOUD_MAIL_SMTP_USER`、`CLOUD_MAIL_SMTP_PASSWORD`、`CLOUD_MAIL_UPSTREAM_URL`、`CLOUD_MAIL_UPSTREAM_HEALTH_URL`、`CLOUD_MAIL_UPSTREAM_USER` 和 `CLOUD_MAIL_UPSTREAM_API_KEY`。监听地址、端口、邮件大小和超时时间有默认值。
+
+### 4. 使用已有配置文件安装
+
+如果你已经通过安全方式准备好了配置，可以显式指定配置文件：
 
 ```bash
 chmod 600 /path/to/cloud-mail-smtp.json
 sudo ./install.sh --config /path/to/cloud-mail-smtp.json
 ```
 
-如果还没有 `config.json`，脚本会自动创建模板并停止，不会启动网关。你必须填写真实的 Cloud Mail 地址、SMTP 用户名、API Key、本地 SMTP 密码和默认发件账号后，再次执行脚本。
+如果目标目录已有 `config.json`，脚本会要求确认后才替换；自动化部署可以加 `--yes`。`--config` 不能和 `--reconfigure` 或 `--non-interactive` 同时使用。
 
-安装脚本会严格按以下顺序执行：
-
-1. 检查当前系统是否为 Linux；
-2. 检查 Docker Engine 和 Docker Compose v2；
-3. 复制网关文件并设置 `config.json` 为 `root:root`、`640`（容器以 UID 1000/GID 0 读取）；
-4. 执行 `docker compose config`；
-5. 构建 Docker 镜像；
-6. 校验网关配置；
-7. 调用 Cloud Mail `/api/smtp/health` 做真实上游连通性检查；
-8. 只有健康检查成功，才执行 `docker compose up`；
-9. 启动后等待 Docker healthcheck 变成 `healthy`。
-
-任何一步失败，脚本都会退出，并且上游检查失败时不会启动 SMTP 网关。默认安装目录是 `/opt/cloud-mail-smtp-gateway`，可通过 `--dir` 修改：
-
-```bash
-sudo ./install.sh --dir /srv/cloud-mail-smtp-gateway
-```
-
-如果目标目录已有 `config.json`，脚本默认保留现有配置。使用 `--config` 替换配置时，需要确认；自动化部署可以使用 `--yes`：
-
-```bash
-sudo ./install.sh --config /path/to/cloud-mail-smtp.json --yes
-```
-
-安装成功后，脚本会打印 SMTP 映射地址和日志命令。常用管理命令：
+### 5. 安装后的管理命令
 
 ```bash
 cd /opt/cloud-mail-smtp-gateway
@@ -130,10 +164,60 @@ docker compose ps
 docker compose logs -f smtp-gateway
 docker compose stop
 docker compose start
+docker compose restart
 docker compose down
 ```
 
-> `config.json` 包含密钥，不要提交 Git，不要通过工单、聊天或公开网盘分享。
+`config.json` 包含本地 SMTP 密码和 Cloud Mail API Key，请设置为仅 root 可读，并且不要通过工单、聊天、公开网盘或 Git 提交。
+
+### 6. 通过 Git 仓库升级
+
+升级前先备份配置并停止旧容器：
+
+```bash
+cd /opt/cloud-mail-smtp-gateway
+sudo cp config.json "config.json.bak.$(date +%Y%m%d%H%M%S)"
+sudo docker compose down
+```
+
+然后在临时目录克隆最新代码。不要在安装目录直接执行 `git pull`，这样可以避免把本地 `config.json`、日志或运行时文件误当成代码变更：
+
+```bash
+cd /tmp
+rm -rf cloud-mail-smtp-gateway-update
+git clone https://github.com/aichenshidelibing/CLOUD-MAIL-Enhanced-smtp-gateway.git cloud-mail-smtp-gateway-update
+```
+
+复制代码文件，但保留安装目录中已有的 `config.json`：
+
+```bash
+sudo cp cloud-mail-smtp-gateway-update/install.sh /opt/cloud-mail-smtp-gateway/
+sudo cp cloud-mail-smtp-gateway-update/Dockerfile /opt/cloud-mail-smtp-gateway/
+sudo cp cloud-mail-smtp-gateway-update/docker-compose.yml /opt/cloud-mail-smtp-gateway/
+sudo cp cloud-mail-smtp-gateway-update/package.json /opt/cloud-mail-smtp-gateway/
+sudo cp cloud-mail-smtp-gateway-update/.dockerignore /opt/cloud-mail-smtp-gateway/
+sudo cp -r cloud-mail-smtp-gateway-update/src /opt/cloud-mail-smtp-gateway/
+```
+
+在安装目录重新构建并验证。上游健康检查失败时不要执行启动命令：
+
+```bash
+cd /opt/cloud-mail-smtp-gateway
+sudo docker compose config
+sudo docker compose build smtp-gateway
+sudo docker compose run --rm --no-deps smtp-gateway node src/cli.js validate --config /app/config.json
+sudo docker compose run --rm --no-deps smtp-gateway node src/cli.js test --config /app/config.json
+sudo docker compose up -d --force-recreate smtp-gateway
+sudo docker compose ps
+```
+
+升级后如果容器不是 `healthy`，立即查看日志并回滚代码或恢复备份配置：
+
+```bash
+sudo docker compose logs --tail=200 smtp-gateway
+sudo cp config.json.bak.YYYYMMDDHHMMSS config.json
+sudo docker compose up -d --force-recreate smtp-gateway
+```
 
 配置示例：
 
@@ -172,7 +256,6 @@ docker compose down
 | `upstream.user` | Cloud Mail SMTP HTTP Basic Auth 用户名。 |
 | `upstream.apiKey` | Cloud Mail SMTP API Key。 |
 | `upstream.timeoutMs` | 单次上游请求超时时间，默认 15000 毫秒。 |
-
 ## 五、启动前验证上游连通性
 
 先验证配置格式：
@@ -281,13 +364,14 @@ chmod 640 config.json`，并限制服务器上可以读取该文件的用户。
 
 ### 1. `Configuration is invalid`
 
-检查 JSON 格式、端口范围、SMTP 用户名/密码、上游 URL、API Key 和超时时间。可以重新复制模板：
+检查 JSON 格式、端口范围、SMTP 用户名/密码、上游 URL、API Key 和超时时间。推荐重新运行配置向导，脚本会自动备份旧配置并重新生成真实 `config.json`：
 
 ```bash
-cp config.example.json config.json
-sudo chown root:root config.json
-chmod 640 config.json
+cd /opt/cloud-mail-smtp-gateway
+sudo ./install.sh --reconfigure
 ```
+
+不要用真实密钥覆盖提交到 Git 的 `config.example.json`，也不要把真实 `config.json` 提交到仓库。
 
 ### 2. `Upstream health check failed: 401`
 
@@ -317,16 +401,7 @@ docker compose run --rm smtp-gateway node src/cli.js test --config /app/config.j
 
 ### 7. 如何升级
 
-备份配置后替换代码文件，再重新构建：
-
-```bash
-cp config.json config.json.bak
-docker compose down
-docker compose up -d --build --force-recreate
-```
-
-升级后先看日志，再使用测试收件地址发送一封小邮件。
-
+请按照“通过 Git 仓库升级”章节操作：先备份 `config.json`，只替换代码文件，然后执行 `validate`、上游 `test` 和 Docker healthcheck。升级后先看日志，再使用测试收件地址发送一封小邮件。
 ## 十、目录说明
 
 ```text
