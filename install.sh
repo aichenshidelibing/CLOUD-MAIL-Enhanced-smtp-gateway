@@ -416,6 +416,17 @@ OPENSSL_CONF
   chown root:root "$cert_file" "$key_file"; chmod 640 "$cert_file" "$key_file"
 }
 
+update_config_server_name() {
+  local config_file="$1" server_name="$TLS_DOMAIN" temporary
+  [ -n "$server_name" ] || return 0
+  validate_domain "$server_name"
+  if grep -Eq '"serverName"[[:space:]]*:' "$config_file"; then
+    temporary="${config_file}.tmp.$$"
+    sed -E "s#(\"serverName\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")#\1$(json_escape "$server_name")\2#" "$config_file" > "$temporary"
+    mv -f -- "$temporary" "$config_file"
+  fi
+}
+
 check_upstream_host() {
   local config_file="$1" response_file="$2" upstream_health_url upstream_user upstream_api_key timeout_ms timeout_seconds http_code
   upstream_health_url="$(json_string_value "$config_file" healthUrl)"; upstream_user="$(json_string_value "$config_file" user last)"; upstream_api_key="$(json_string_value "$config_file" apiKey)"; timeout_ms="$(json_number_value "$config_file" timeoutMs)"
@@ -525,6 +536,8 @@ elif [ "$RECONFIGURE" -eq 1 ] || [ "$NON_INTERACTIVE" -eq 1 ] || [ ! -f "$INSTAL
   write_config_interactive "$INSTALL_DIR/config.json"
 fi
 [ -f "$INSTALL_DIR/config.json" ] || die "configuration file was not created: $INSTALL_DIR/config.json"
+if [ -n "$TLS_DOMAIN" ]; then TLS_HOSTNAME="$TLS_DOMAIN"; fi
+update_config_server_name "$INSTALL_DIR/config.json"
 prepare_tls_material
 chown root:root "$INSTALL_DIR/config.json"; chmod 640 "$INSTALL_DIR/config.json"
 write_compose_env "$INSTALL_DIR/config.json" "$INSTALL_DIR/.env"

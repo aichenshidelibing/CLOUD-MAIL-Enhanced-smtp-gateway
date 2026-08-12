@@ -157,6 +157,8 @@ sudo ./install.sh --domain smtp.example.com \
   --letsencrypt --letsencrypt-email admin@example.com --yes
 ```
 
+如果安装目录中已经存在 `config.json`，上述参数仍会更新 TLS 证书域名、Docker 网络别名和证书；不会删除现有 CLOUD-MAIL API 配置。需要重新填写所有配置时再加 `--reconfigure`。
+
 脚本会自动完成：
 
 - 安装 `certbot`（Debian/Ubuntu 使用 `apt-get`；其他发行版请预装 certbot）；
