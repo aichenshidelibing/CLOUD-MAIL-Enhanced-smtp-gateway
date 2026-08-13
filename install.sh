@@ -17,6 +17,8 @@ TLS_DOMAIN="${CLOUD_MAIL_SMTP_TLS_DOMAIN:-}"
 LE_ENABLED="${CLOUD_MAIL_SMTP_LETSENCRYPT:-0}"
 LE_EMAIL="${CLOUD_MAIL_SMTP_LETSENCRYPT_EMAIL:-}"
 LE_STAGING="${CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING:-0}"
+LE_MODE="${CLOUD_MAIL_SMTP_LETSENCRYPT_MODE:-standalone}"
+LE_WEBROOT="${CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT:-/var/www/letsencrypt}"
 [ -n "${CLOUD_MAIL_LANGUAGE:-}" ] && LANGUAGE_EXPLICIT=1
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
@@ -48,6 +50,11 @@ text() {
     zh:le_renewal) printf '已配置自动续签和续签后自动重启网关' ;; en:le_renewal) printf 'Automatic renewal and post-renewal gateway restart configured' ;;
     zh:le_dns_check) printf '检查域名 DNS 是否指向本服务器' ;; en:le_dns_check) printf 'Checking that DNS points to this server' ;;
     zh:le_port_check) printf '检查 TCP 80 端口是否可用于 HTTP-01 验证' ;; en:le_port_check) printf 'Checking whether TCP port 80 is available for HTTP-01 validation' ;;
+    zh:le_mode) printf 'Let’s Encrypt 验证模式（standalone/webroot）' ;; en:le_mode) printf 'Let’s Encrypt challenge mode (standalone/webroot)' ;;
+    zh:le_webroot) printf 'Let’s Encrypt Webroot 目录' ;; en:le_webroot) printf 'Let’s Encrypt webroot directory' ;;
+    zh:le_webroot_check) printf '验证 Webroot 挑战文件可从域名访问' ;; en:le_webroot_check) printf 'Checking that the webroot challenge file is reachable through the domain' ;;
+    zh:tls_cert_file) printf '已有 TLS 证书文件路径（可留空）' ;; en:tls_cert_file) printf 'Existing TLS certificate path (optional)' ;;
+    zh:tls_key_file) printf '已有 TLS 私钥文件路径（可留空）' ;; en:tls_key_file) printf 'Existing TLS private key path (optional)' ;;
     zh:preflight) printf '在创建 Docker 容器前检查 Cloud Mail 连通性' ;; en:preflight) printf 'Checking Cloud Mail connectivity before creating a Docker container' ;;
     zh:validate_compose) printf '校验 Docker Compose 配置' ;; en:validate_compose) printf 'Validating Docker Compose configuration' ;;
     zh:build_image) printf '构建网关镜像' ;; en:build_image) printf 'Building the gateway image' ;;
@@ -88,11 +95,16 @@ Options:
   --letsencrypt         Enable Let’s Encrypt certificate issuance
   --letsencrypt-email E Email address for Let’s Encrypt notices
   --letsencrypt-staging Use the Let’s Encrypt staging CA
+  --letsencrypt-mode MODE  Challenge mode: standalone or webroot
+  --letsencrypt-webroot DIR Directory served for /.well-known/acme-challenge
+  --tls-cert-file FILE     Existing certificate to copy into the gateway
+  --tls-key-file FILE      Existing private key to copy into the gateway
 
 Let’s Encrypt:
   Set CLOUD_MAIL_SMTP_TLS_DOMAIN and CLOUD_MAIL_SMTP_LETSENCRYPT=1, or enter the
-  domain in the interactive wizard. The standalone HTTP-01 challenge requires
-  DNS to point to this server and TCP port 80 to be free during issuance.
+  domain in the interactive wizard. HTTP-01 always uses public TCP port 80.
+  standalone temporarily listens on port 80; webroot writes the challenge into
+  an existing Nginx/Apache/Caddy webroot and does not bind port 80.
   -h, --help            Show this help
 
 Environment variables for --non-interactive:
@@ -112,6 +124,8 @@ Environment variables for --non-interactive:
   CLOUD_MAIL_SMTP_LETSENCRYPT (1 to request Let's Encrypt; default: 0)
   CLOUD_MAIL_SMTP_LETSENCRYPT_EMAIL (required when Let's Encrypt is enabled)
   CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING (1 to use the Let's Encrypt staging CA)
+  CLOUD_MAIL_SMTP_LETSENCRYPT_MODE (standalone or webroot; default: standalone)
+  CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT (default: /var/www/letsencrypt)
 
 Legacy compatibility variables:
   CLOUD_MAIL_UPSTREAM_URL
@@ -125,6 +139,16 @@ die() { printf '%s: %s\n' "$(text error)" "$*" >&2; exit 1; }
 info() { printf '\n==> %s\n' "$*"; }
 
 set_language() { case "$1" in zh|en) UI_LANGUAGE="$1" ;; *) die "$(text language_invalid): $1" ;; esac; }
+validate_letsencrypt_mode() {
+  case "$LE_MODE" in
+    standalone|webroot) ;;
+    *) die 'Let’s Encrypt mode must be standalone or webroot' ;;
+  esac
+  if [ "$LE_MODE" = webroot ]; then
+    require_value 'Let’s Encrypt webroot' "$LE_WEBROOT"
+    case "$LE_WEBROOT" in /*) ;; *) die 'Let’s Encrypt webroot must be an absolute path' ;; esac
+  fi
+}
 select_language() {
   local value
   if [ "$LANGUAGE_EXPLICIT" -eq 1 ] || [ "$NON_INTERACTIVE" -eq 1 ]; then set_language "$UI_LANGUAGE"; return; fi
@@ -235,6 +259,28 @@ certificate_has_sans() {
   done
 }
 
+validate_certificate_and_key() {
+  local cert_file="$1" key_file="$2" expected_domain="${3:-}" cert_pub key_pub san_output
+  command -v openssl >/dev/null 2>&1 || die 'openssl is required to validate TLS certificate files'
+  [ -f "$cert_file" ] || die "TLS certificate is not a regular file: $cert_file"
+  [ -f "$key_file" ] || die "TLS private key is not a regular file: $key_file"
+  [ -r "$cert_file" ] || die "TLS certificate is not readable: $cert_file"
+  [ -r "$key_file" ] || die "TLS private key is not readable: $key_file"
+  openssl x509 -in "$cert_file" -noout >/dev/null 2>&1 || die "TLS certificate cannot be parsed: $cert_file"
+  openssl pkey -in "$key_file" -noout >/dev/null 2>&1 || die "TLS private key cannot be parsed: $key_file"
+  openssl x509 -in "$cert_file" -checkend 0 -noout >/dev/null 2>&1 || die "TLS certificate is expired: $cert_file"
+
+  cert_pub="$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  key_pub="$(openssl pkey -in "$key_file" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] || die 'TLS certificate and private key do not match'
+
+  if [ -n "$expected_domain" ]; then
+    san_output="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null || true)"
+    [ -n "$san_output" ] || die "TLS certificate has no Subject Alternative Name for $expected_domain"
+    printf '%s' "$san_output" | grep -Fq "DNS:$expected_domain" || die "TLS certificate SAN does not contain $expected_domain"
+  fi
+}
+
 validate_domain() {
   local domain="$1"
   [ -n "$domain" ] || die 'Let’s Encrypt domain must not be empty'
@@ -266,22 +312,50 @@ local_server_ipv4s() {
   fi
 }
 
+check_webroot_prerequisites() {
+  local domain="$1" challenge_dir token challenge_file expected response response_file http_code
+  command -v curl >/dev/null 2>&1 || die 'curl is required for the webroot challenge check'
+  challenge_dir="$LE_WEBROOT/.well-known/acme-challenge"
+  mkdir -p "$challenge_dir"
+  chmod 755 "$LE_WEBROOT" "$LE_WEBROOT/.well-known" "$challenge_dir" 2>/dev/null || true
+  token="cloud-mail-smtp-gateway-$(date +%s)-$$"
+  challenge_file="$challenge_dir/$token"
+  expected="cloud-mail-smtp-gateway-webroot-check"
+  printf '%s' "$expected" > "$challenge_file"
+  info "$(text le_webroot_check): http://$domain/.well-known/acme-challenge/$token"
+  response_file="$(mktemp)"
+  http_code="$(curl --silent --show-error --location --insecure --connect-timeout 10 --max-time 20 --output "$response_file" --write-out '%{http_code}' "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+  response="$(cat "$response_file" 2>/dev/null || true)"
+  rm -f -- "$challenge_file" "$response_file"
+  [ "$http_code" = 200 ] && [ "$response" = "$expected" ] || die "webroot challenge is not reachable at http://$domain/.well-known/acme-challenge/ (HTTP $http_code)"
+}
+
 check_letsencrypt_prerequisites() {
   local domain="$1" resolved ip matched=0
-  info "$(text le_dns_check): $domain"
   command -v getent >/dev/null 2>&1 || die 'getent is required to verify the Let’s Encrypt domain DNS record'
   resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
   [ -n "$resolved" ] || die "Let’s Encrypt domain does not resolve to an IPv4 address: $domain"
-  while IFS= read -r ip; do
-    [ -n "$ip" ] || continue
-    if local_server_ipv4s | grep -Fxq "$ip"; then matched=1; break; fi
-  done <<EOF_DNS
+
+  if [ "$LE_MODE" = standalone ]; then
+    info "$(text le_dns_check): $domain"
+    while IFS= read -r ip; do
+      [ -n "$ip" ] || continue
+      if local_server_ipv4s | grep -Fxq "$ip"; then matched=1; break; fi
+    done <<EOF_DNS
 $resolved
 EOF_DNS
-  [ "$matched" -eq 1 ] || die "DNS for $domain does not point to this server. Resolved: $(printf '%s' "$resolved" | tr '\n' ' ')"
-  info "$(text le_port_check)"
-  if command -v ss >/dev/null 2>&1 && ss -H -ltn '( sport = :80 )' 2>/dev/null | grep -q .; then
-    die 'TCP port 80 is already in use; stop the service or use a reverse-proxy/webroot ACME flow before requesting Let’s Encrypt'
+    [ "$matched" -eq 1 ] || die "DNS for $domain does not point to this server. Resolved: $(printf '%s' "$resolved" | tr '\n' ' ')"
+    info "$(text le_port_check)"
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn '( sport = :80 )' 2>/dev/null | grep -q .; then
+      die 'TCP port 80 is already in use; use --letsencrypt-mode webroot or DNS-01 instead'
+    fi
+  else
+    # Webroot works with an existing reverse proxy, CDN, or load balancer. The
+    # public challenge URL is the authoritative reachability check; requiring
+    # the DNS A record to equal a local interface would incorrectly reject
+    # Cloudflare-proxied and reverse-proxied domains.
+    info "$(text le_dns_check): $domain (webroot/reverse proxy mode)"
+    check_webroot_prerequisites "$domain"
   fi
 }
 
@@ -340,12 +414,19 @@ obtain_letsencrypt_certificate() {
   check_letsencrypt_prerequisites "$TLS_DOMAIN"
   if [ "$LE_STAGING" -eq 1 ]; then staging_args+=(--staging); fi
   info "$(text le_prepare): $TLS_DOMAIN"
-  if ! certbot certonly --standalone --non-interactive --agree-tos --no-eff-email --keep-until-expiring \
-      --preferred-challenges http "${staging_args[@]}" --email "$LE_EMAIL" -d "$TLS_DOMAIN"; then
-    die 'Let’s Encrypt certificate request failed. Confirm DNS points to this server and TCP port 80 is reachable.'
+  local certbot_args=(certbot certonly --non-interactive --agree-tos --no-eff-email --keep-until-expiring
+    --preferred-challenges http "${staging_args[@]}" --email "$LE_EMAIL" -d "$TLS_DOMAIN")
+  if [ "$LE_MODE" = standalone ]; then
+    certbot_args+=(--standalone)
+  else
+    certbot_args+=(--webroot -w "$LE_WEBROOT")
+  fi
+  if ! "${certbot_args[@]}"; then
+    die 'Let’s Encrypt certificate request failed. Confirm DNS, TCP 80, and the webroot configuration.'
   fi
   [ -s "$cert_dir/fullchain.pem" ] || die "Let’s Encrypt certificate not found: $cert_dir/fullchain.pem"
   [ -s "$cert_dir/privkey.pem" ] || die "Let’s Encrypt private key not found: $cert_dir/privkey.pem"
+  validate_certificate_and_key "$cert_dir/fullchain.pem" "$cert_dir/privkey.pem" "$TLS_DOMAIN"
   install -m 0640 -o root -g root "$cert_dir/fullchain.pem" "$cert_file"
   install -m 0640 -o root -g root "$cert_dir/privkey.pem" "$key_file"
   install_letsencrypt_hook
@@ -366,11 +447,10 @@ prepare_tls_material() {
   fi
   if [ -n "$TLS_CERT_SOURCE" ] || [ -n "$TLS_KEY_SOURCE" ]; then
     [ -n "$TLS_CERT_SOURCE" ] && [ -n "$TLS_KEY_SOURCE" ] || die 'both TLS certificate and private key source files are required'
-    [ -f "$TLS_CERT_SOURCE" ] || die "TLS certificate not found: $TLS_CERT_SOURCE"
-    [ -f "$TLS_KEY_SOURCE" ] || die "TLS private key not found: $TLS_KEY_SOURCE"
-    cp -f -- "$TLS_CERT_SOURCE" "$cert_file"; cp -f -- "$TLS_KEY_SOURCE" "$key_file"
+    validate_certificate_and_key "$TLS_CERT_SOURCE" "$TLS_KEY_SOURCE" "$TLS_DOMAIN"
+    install -m 0640 -o root -g root "$TLS_CERT_SOURCE" "$cert_file"
+    install -m 0640 -o root -g root "$TLS_KEY_SOURCE" "$key_file"
     info "$(text tls_existing): $cert_file"
-    chown root:root "$cert_file" "$key_file"; chmod 640 "$cert_file" "$key_file"
     return
   fi
 
@@ -461,16 +541,32 @@ write_config_interactive() {
       TLS_HOSTNAME="$TLS_DOMAIN"
       le_answer="$(prompt_value le_enable "$([ "$LE_ENABLED" -eq 1 ] && printf Y || printf n)")"
       case "$le_answer" in n|N|no|NO) LE_ENABLED=0 ;; *) LE_ENABLED=1 ;; esac
-      if [ "$LE_ENABLED" -eq 1 ]; then LE_EMAIL="$(prompt_value le_email '')"; fi
+      if [ "$LE_ENABLED" -eq 1 ]; then
+        LE_EMAIL="$(prompt_value le_email "$LE_EMAIL")"
+        LE_MODE="$(prompt_value le_mode "$LE_MODE")"
+        validate_letsencrypt_mode
+        if [ "$LE_MODE" = webroot ]; then LE_WEBROOT="$(prompt_value le_webroot "$LE_WEBROOT")"; fi
+      else
+        TLS_CERT_SOURCE="$(prompt_value tls_cert_file "$TLS_CERT_SOURCE")"
+        TLS_KEY_SOURCE="$(prompt_value tls_key_file "$TLS_KEY_SOURCE")"
+      fi
     else
       LE_ENABLED=0
       TLS_HOSTNAME="${CLOUD_MAIL_SMTP_TLS_HOSTNAME:-smtp-gateway}"
+      TLS_CERT_SOURCE="$(prompt_value tls_cert_file "$TLS_CERT_SOURCE")"
+      TLS_KEY_SOURCE="$(prompt_value tls_key_file "$TLS_KEY_SOURCE")"
     fi
     printf '%s\n\n' "$(text credential_notice)" >&2
   fi
   require_value 'Cloud Mail SMTP username' "$upstream_user"; require_value 'Cloud Mail SMTP API key' "$upstream_api_key"; require_value 'upstream URL' "$upstream_url"; require_value 'upstream health URL' "$upstream_health_url"
   case "$LE_ENABLED" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_LETSENCRYPT must be 0 or 1' ;; esac
-  if [ "$LE_ENABLED" -eq 1 ]; then validate_domain "$TLS_DOMAIN"; require_value 'Let’s Encrypt email' "$LE_EMAIL"; fi
+  validate_letsencrypt_mode
+  if [ "$LE_ENABLED" -eq 1 ]; then
+    validate_domain "$TLS_DOMAIN"; require_value 'Let’s Encrypt email' "$LE_EMAIL"
+    [ -z "$TLS_CERT_SOURCE" ] && [ -z "$TLS_KEY_SOURCE" ] || die 'Do not combine Let’s Encrypt with manual TLS certificate files'
+  elif [ -n "$TLS_CERT_SOURCE" ] || [ -n "$TLS_KEY_SOURCE" ]; then
+    [ -n "$TLS_CERT_SOURCE" ] && [ -n "$TLS_KEY_SOURCE" ] || die 'both TLS certificate and private key source files are required'
+  fi
   smtp_user="$upstream_user"; smtp_password="$upstream_api_key"
   case "$listen_port" in *[!0-9]*|'') die 'listen port must be an integer' ;; esac; case "$max_message_size" in *[!0-9]*|'') die 'maximum message size must be an integer' ;; esac; case "$timeout_ms" in *[!0-9]*|'') die 'upstream timeout must be an integer' ;; esac
   [ "$listen_port" -ge 1 ] && [ "$listen_port" -le 65535 ] || die 'listen port must be 1-65535'
@@ -499,6 +595,10 @@ while [ "$#" -gt 0 ]; do
     --language|--lang) [ "$#" -ge 2 ] || die '--language requires zh or en'; UI_LANGUAGE="$2"; LANGUAGE_EXPLICIT=1; shift 2 ;;
     --domain) [ "$#" -ge 2 ] || die '--domain requires a DNS name'; TLS_DOMAIN="$2"; TLS_HOSTNAME="$2"; shift 2 ;;
     --letsencrypt) LE_ENABLED=1; shift ;;
+    --letsencrypt-mode) [ "$#" -ge 2 ] || die '--letsencrypt-mode requires standalone or webroot'; LE_MODE="$2"; shift 2 ;;
+    --letsencrypt-webroot) [ "$#" -ge 2 ] || die '--letsencrypt-webroot requires a directory'; LE_WEBROOT="$2"; LE_MODE=webroot; shift 2 ;;
+    --tls-cert-file) [ "$#" -ge 2 ] || die '--tls-cert-file requires a file'; TLS_CERT_SOURCE="$2"; shift 2 ;;
+    --tls-key-file) [ "$#" -ge 2 ] || die '--tls-key-file requires a file'; TLS_KEY_SOURCE="$2"; shift 2 ;;
     --letsencrypt-email) [ "$#" -ge 2 ] || die '--letsencrypt-email requires an email address'; LE_EMAIL="$2"; shift 2 ;;
     --letsencrypt-staging) LE_STAGING=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
@@ -510,6 +610,7 @@ done
 set_language "$UI_LANGUAGE"
 case "$LE_ENABLED" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_LETSENCRYPT must be 0 or 1' ;; esac
 case "$LE_STAGING" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING must be 0 or 1' ;; esac
+validate_letsencrypt_mode
 if [ -n "$TLS_DOMAIN" ]; then TLS_HOSTNAME="$TLS_DOMAIN"; fi
 [ "$NON_INTERACTIVE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --non-interactive cannot be used together'
 [ "$RECONFIGURE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --reconfigure cannot be used together'

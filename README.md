@@ -107,65 +107,131 @@ sudo env CLOUD_MAIL_SMTP_TLS_HOSTNAME='smtp-gateway,mail-gateway,192.168.1.50' \
   ./install.sh --language zh
 ```
 
-生产环境建议使用受信任 CA 签发的证书和私钥：
+生产环境建议使用受信任 CA 签发的证书和私钥。脚本会在复制前检查：证书和私钥可解析、证书未过期、证书与私钥匹配；如果配置了 `--domain` 或 `CLOUD_MAIL_SMTP_TLS_DOMAIN`，还会检查证书 SAN 包含该域名：
+
+```bash
+sudo ./install.sh \
+  --tls-cert-file /root/certs/smtp.example.com/fullchain.pem \
+  --tls-key-file /root/certs/smtp.example.com/privkey.pem \
+  --reconfigure --yes
+```
+
+也可以使用环境变量：
 
 ```bash
 sudo env \
-  CLOUD_MAIL_SMTP_TLS_CERT_FILE=/secure/certs/smtp-gateway.crt \
-  CLOUD_MAIL_SMTP_TLS_KEY_FILE=/secure/certs/smtp-gateway.key \
+  CLOUD_MAIL_SMTP_TLS_CERT_FILE=/root/certs/smtp.example.com/fullchain.pem \
+  CLOUD_MAIL_SMTP_TLS_KEY_FILE=/root/certs/smtp.example.com/privkey.pem \
   ./install.sh --reconfigure --yes
 ```
 
-安装脚本不会在普通重新安装时覆盖已有证书。替换证书后执行：
+证书文件可以是包含完整证书链的 `fullchain.pem`；私钥必须是与服务器证书匹配的 PEM 私钥。安装后文件位于：
+
+```text
+/opt/cloud-mail-smtp-gateway/tls/server.crt
+/opt/cloud-mail-smtp-gateway/tls/server.key
+```
+
+### Cloudflare Origin CA 证书
+
+可以把 Cloudflare Origin CA 证书通过 `--tls-cert-file` 和 `--tls-key-file` 配置到网关，但它的信任范围必须注意：Origin CA 主要用于 **Cloudflare → 源站** 的加密，普通 SMTP 客户端或业务容器默认通常不信任 Cloudflare Origin CA，因此可能出现 `x509: certificate signed by unknown authority`。
+
+- 如果 SMTP 客户端直接连接网关，生产环境优先使用 Let’s Encrypt、ZeroSSL 或其他公网信任 CA；
+- 如果使用 Origin CA，必须把 Cloudflare Origin CA 根证书导入每个业务容器/客户端的信任库，并使用证书 SAN 中的域名连接；
+- Cloudflare Universal SSL 的边缘证书不能直接当作源站 SMTP 证书下载部署；
+- 普通 Cloudflare 橙色云代理不应被当作 SMTP TCP 代理使用。SMTP 需要直连源站（DNS only），或使用已开通的 Spectrum/TCP 代理；
+- 不要把 Cloudflare Origin CA 证书用于让任意公网 SMTP 客户端“默认信任”。
+
+替换证书后重建/重启网关：
 
 ```bash
 cd /opt/cloud-mail-smtp-gateway
-docker compose restart
+docker compose up -d --force-recreate smtp-gateway
 ```
 
-使用自签名证书时，SMTP 客户端应信任 `tls/server.crt`。测试阶段可以关闭“验证服务器证书”，但生产环境不建议关闭证书校验。业务容器使用共享网络且未启用 Let’s Encrypt 时，TLS 主机名应填写 `smtp-gateway`；启用 Let’s Encrypt 后应填写证书域名。
+使用自签名证书时，SMTP 客户端应信任 `tls/server.crt`。测试阶段可以关闭“验证服务器证书”，但生产环境不建议关闭证书校验。业务容器使用共享网络且未启用 Let’s Encrypt 时，TLS 主机名应填写 `smtp-gateway`；启用 Let’s Encrypt 或手动公网证书后，应填写证书 SAN 中的域名。
 
 ## Let’s Encrypt：域名绑定、自动申请与自动续签
 
 生产环境推荐使用一个专用 SMTP 域名，例如 `smtp.example.com`。在运行安装脚本前，请完成：
 
 1. 在 DNS 服务商处创建 `A` 记录：`smtp.example.com -> 服务器公网 IPv4`；
-2. 确认服务器安全组和防火墙允许 TCP `80`（首次申请使用 HTTP-01）以及你的 SMTP 端口；
-3. 确认 TCP 80 没有被 Nginx、Apache 或其他程序占用。脚本会在申请前检查 DNS 和端口；
-4. 使用域名连接 SMTP，不要用公网 IP：证书只对域名有效。
+2. 确认服务器安全组和防火墙允许公网 TCP `80`（HTTP-01 验证）以及你的 SMTP 端口；
+3. 使用域名连接 SMTP，不要用公网 IP：证书只对证书 SAN 中的域名/IP 有效。
 
-交互式安装时，填写 SMTP TLS 域名后选择自动申请，并填写邮箱。非交互式安装：
+> HTTP-01 的公网验证入口固定是 TCP `80`，不能把 Let’s Encrypt 的验证端口改成 12525、8080 或其他端口。若 80 已被 Nginx、Apache、Caddy 或其他 Web 服务占用，请使用下面的 `webroot` 模式；不要让安装脚本停止现有 Web 服务。
+
+### 4.1 standalone 模式（80 必须空闲）
+
+standalone 是默认模式。Certbot 会临时监听 TCP 80，因此申请时 80 不能被其他服务占用：
+
+```bash
+sudo ./install.sh \
+  --domain smtp.example.com \
+  --letsencrypt \
+  --letsencrypt-email admin@example.com \
+  --letsencrypt-mode standalone \
+  --yes
+```
+
+### 4.2 webroot 模式（80 可由现有 Web 服务占用）
+
+webroot 模式由现有 Web 服务继续监听 80，Certbot 只把 HTTP-01 挑战文件写入指定目录。现有 Web 服务必须把 `/.well-known/acme-challenge/` 映射到同一个目录，并且该 URL 能从公网返回安装脚本写入的文件。
+
+Nginx 示例：
+
+```nginx
+server {
+    listen 80;
+    server_name smtp.example.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+}
+```
+
+对应的实际文件目录是：
+
+```text
+/var/www/letsencrypt/.well-known/acme-challenge/
+```
+
+安装命令：
+
+```bash
+sudo ./install.sh \
+  --domain smtp.example.com \
+  --letsencrypt \
+  --letsencrypt-email admin@example.com \
+  --letsencrypt-mode webroot \
+  --letsencrypt-webroot /var/www/letsencrypt \
+  --yes
+```
+
+非交互式环境变量写法：
 
 ```bash
 sudo env \
-  CLOUD_MAIL_LANGUAGE=zh \
-  CLOUD_MAIL_LISTEN_HOST=0.0.0.0 \
-  CLOUD_MAIL_LISTEN_PORT=12525 \
-  CLOUD_MAIL_ADDRESS=https://mail.example.com \
-  CLOUD_MAIL_UPSTREAM_USER=my-app \
-  CLOUD_MAIL_UPSTREAM_API_KEY='replace-with-real-key' \
   CLOUD_MAIL_SMTP_TLS_DOMAIN=smtp.example.com \
   CLOUD_MAIL_SMTP_LETSENCRYPT=1 \
   CLOUD_MAIL_SMTP_LETSENCRYPT_EMAIL=admin@example.com \
+  CLOUD_MAIL_SMTP_LETSENCRYPT_MODE=webroot \
+  CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT=/var/www/letsencrypt \
   ./install.sh --non-interactive --yes
 ```
 
-也可以使用命令行参数：
+安装脚本在创建网关 Docker 容器前会执行预检查：验证域名解析、验证 webroot 目录存在，并从 `http://域名/.well-known/acme-challenge/...` 访问临时挑战文件。预检查失败时不会继续创建或启动网关容器。若服务器不支持访问自身公网 IP（NAT 回环关闭），请从外部网络手动确认该 URL 可访问后再运行脚本；Cloudflare/CDN、反向代理或多层 NAT 也必须把该路径正确转发到这台服务器。
+
+### 自动续签
+
+脚本会自动创建 Certbot deploy hook。续签成功后会把新证书复制到网关并重启 `smtp-gateway`；优先启用发行版提供的 `certbot.timer`，否则写入 `/etc/cron.d/cloud-mail-smtp-gateway-certbot`。webroot 模式续签时 80 仍由现有 Web 服务占用，不需要停站。
 
 ```bash
-sudo ./install.sh --domain smtp.example.com \
-  --letsencrypt --letsencrypt-email admin@example.com --yes
+sudo certbot renew --dry-run
+sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/cloud-mail-smtp-gateway
 ```
-
-如果安装目录中已经存在 `config.json`，上述参数仍会更新 TLS 证书域名、Docker 网络别名和证书；不会删除现有 CLOUD-MAIL API 配置。需要重新填写所有配置时再加 `--reconfigure`。
-
-脚本会自动完成：
-
-- 安装 `certbot`（Debian/Ubuntu 使用 `apt-get`；其他发行版请预装 certbot）；
-- 使用 Certbot standalone HTTP-01 申请证书；申请前检查域名解析到本服务器，并拒绝在 TCP 80 已被占用时继续；
-- 将 `fullchain.pem` 和 `privkey.pem` 安全复制到安装目录的 `tls/`；
-- 创建 Certbot deploy hook，续签成功后自动复制新证书并重启 `smtp-gateway`；
-- 优先启用发行版提供的 `certbot.timer`，否则写入 `/etc/cron.d/cloud-mail-smtp-gateway-certbot` 作为续签计划。
 
 默认使用 Let’s Encrypt 正式环境。首次调试 DNS 时可先加：
 
@@ -173,17 +239,7 @@ sudo ./install.sh --domain smtp.example.com \
 CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING=1
 ```
 
-注意：HTTP-01 申请/续签必须能从公网访问 TCP 80。如果 80 端口必须由现有 Web 服务长期占用，应改用 DNS-01，或使用反向代理/Certbot webroot 方案；当前脚本不会强行停止现有 Web 服务。Let’s Encrypt 证书通常约 90 天有效，Certbot 会在合适的时间自动续签。
-
-续签检查：
-
-```bash
-sudo certbot renew --dry-run
-sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/cloud-mail-smtp-gateway
-```
-
-SMTP 客户端设置：`smtp.example.com` + 宿主机映射端口（如 `12525`）+ **普通 SMTP/STARTTLS**，不要选择 SMTPS/SSL 465。加入共享 Docker 网络的业务容器建议使用你的 Let’s Encrypt 域名（例如 `smtp.example.com:2525`），安装脚本会把该域名加入网关容器别名，因此容器内也能通过该域名访问并完成证书校验；未启用 Let’s Encrypt 时才使用 `smtp-gateway:2525`。
-
+SMTP 客户端设置：`smtp.example.com` + 宿主机映射端口（如 `12525`）+ **普通 SMTP/STARTTLS**，不要选择 SMTPS/SSL 465。加入共享 Docker 网络的业务容器也可使用证书域名和容器端口 `2525`；未启用公网证书时才使用 `smtp-gateway:2525` 并导入自签名 CA。
 ## 4. 安装
 
 仅支持 Linux + Docker Compose v2，不提供 Windows 安装程序。
