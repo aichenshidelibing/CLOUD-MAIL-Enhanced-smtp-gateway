@@ -54,6 +54,12 @@ text() {
     zh:le_renewal) printf '已配置自动续签和续签后自动重启网关' ;; en:le_renewal) printf 'Automatic renewal and post-renewal gateway restart configured' ;;
     zh:le_dns_check) printf '检查域名 DNS 是否指向本服务器' ;; en:le_dns_check) printf 'Checking that DNS points to this server' ;;
     zh:le_port_check) printf '检查 TCP 80 端口是否可用于 HTTP-01 验证' ;; en:le_port_check) printf 'Checking whether TCP port 80 is available for HTTP-01 validation' ;;
+    zh:le_dns_resolved) printf '域名解析结果' ;; en:le_dns_resolved) printf 'DNS records resolved for the domain' ;;
+    zh:le_server_ips) printf '本机检测到的地址' ;; en:le_server_ips) printf 'Addresses detected on this server' ;;
+    zh:le_dns_mismatch) printf 'DNS 没有指向本服务器' ;; en:le_dns_mismatch) printf 'DNS does not point to this server' ;;
+    zh:le_ipv6_mismatch) printf 'AAAA 记录没有指向本服务器' ;; en:le_ipv6_mismatch) printf 'The AAAA record does not point to this server' ;;
+    zh:le_reserved_address) printf '域名解析到了不可用于公网验证的保留地址' ;; en:le_reserved_address) printf 'The domain resolves to a non-public address that cannot be used for public validation' ;;
+    zh:le_certbot_log) printf 'Certbot 完整日志' ;; en:le_certbot_log) printf 'Full Certbot log' ;;
     zh:le_mode) printf 'Let’s Encrypt 验证模式（standalone/webroot）' ;; en:le_mode) printf 'Let’s Encrypt challenge mode (standalone/webroot)' ;;
     zh:le_webroot) printf 'Let’s Encrypt Webroot 目录' ;; en:le_webroot) printf 'Let’s Encrypt webroot directory' ;;
     zh:le_webroot_check) printf '验证 Webroot 挑战文件可从域名访问' ;; en:le_webroot_check) printf 'Checking that the webroot challenge file is reachable through the domain' ;;
@@ -333,6 +339,30 @@ local_server_ipv4s() {
     done
   fi
 }
+local_server_ipv6s() {
+  local ip
+  if command -v ip >/dev/null 2>&1; then
+    ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | while IFS= read -r ip; do
+      [ -n "$ip" ] && printf '%s\n' "$ip"
+    done
+  fi
+}
+
+is_non_public_ipv4() {
+  local ip="$1"
+  case "$ip" in
+    0.*|10.*|100.64.*|100.65.*|100.66.*|100.67.*|100.68.*|100.69.*|100.70.*|100.71.*|100.72.*|100.73.*|100.74.*|100.75.*|100.76.*|100.77.*|100.78.*|100.79.*|100.8*.*|100.9*.*|127.*|169.254.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2[0-9].*|172.3[0-1].*|192.0.0.*|192.0.2.*|192.168.*|198.18.*|198.19.*|198.51.100.*|203.0.113.*|224.*|225.*|226.*|227.*|228.*|229.*|230.*|231.*|232.*|233.*|234.*|235.*|236.*|237.*|238.*|239.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_letsencrypt_dns_diagnostics() {
+  local domain="$1" resolved4="$2" resolved6="$3" server4 server6
+  server4="$(local_server_ipv4s | sort -u | tr '\n' ' ' || true)"
+  server6="$(local_server_ipv6s | sort -u | tr '\n' ' ' || true)"
+  printf '%s: A=%s; AAAA=%s\n' "$(text le_dns_resolved)" "${resolved4:-none}" "${resolved6:-none}" >&2
+  printf '%s: IPv4=%s; IPv6=%s\n' "$(text le_server_ips)" "${server4:-none}" "${server6:-none}" >&2
+}
 
 webroot_challenge_diagnostics() {
   local domain="$1" challenge_file="$2" response_file="$3" http_code="$4" response="$5" resolved response_excerpt
@@ -377,23 +407,54 @@ check_webroot_prerequisites() {
 }
 
 check_letsencrypt_prerequisites() {
-  local domain="$1" resolved ip matched=0
+  local domain="$1" resolved4 resolved6 ip matched4=0 matched6=0 server4 server6
   command -v getent >/dev/null 2>&1 || die 'getent is required to verify the Let’s Encrypt domain DNS record'
-  resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
-  [ -n "$resolved" ] || die "Let’s Encrypt domain does not resolve to an IPv4 address: $domain"
+  resolved4="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+  resolved6="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+  [ -n "$resolved4" ] || [ -n "$resolved6" ] || die "Let’s Encrypt domain does not resolve to an A or AAAA address: $domain"
+  print_letsencrypt_dns_diagnostics "$domain" "$(printf '%s' "$resolved4" | tr '\n' ' ')" "$(printf '%s' "$resolved6" | tr '\n' ' ')"
+
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    if is_non_public_ipv4 "$ip"; then
+      die "$(text le_reserved_address): $domain -> $ip. Use a public A record for the server, not a private, benchmark, proxy-only, or documentation address."
+    fi
+  done <<EOF_DNS4
+$resolved4
+EOF_DNS4
 
   if [ "$LE_MODE" = standalone ]; then
     info "$(text le_dns_check): $domain"
+    server4="$(local_server_ipv4s | sort -u || true)"
     while IFS= read -r ip; do
       [ -n "$ip" ] || continue
-      if local_server_ipv4s | grep -Fxq "$ip"; then matched=1; break; fi
-    done <<EOF_DNS
-$resolved
-EOF_DNS
-    [ "$matched" -eq 1 ] || die "DNS for $domain does not point to this server. Resolved: $(printf '%s' "$resolved" | tr '\n' ' ')"
+      if printf '%s\n' "$server4" | grep -Fxq "$ip"; then matched4=1; break; fi
+    done <<EOF_DNS4_MATCH
+$resolved4
+EOF_DNS4_MATCH
+    if [ -n "$resolved4" ] && [ "$matched4" -ne 1 ]; then
+      printf '%s: resolved A=%s; local IPv4=%s\n' "$(text le_dns_mismatch)" "$(printf '%s' "$resolved4" | tr '\n' ' ')" "$(printf '%s' "$server4" | tr '\n' ' ')" >&2
+      die "DNS for $domain does not point to this server"
+    fi
+
+    if [ -n "$resolved6" ]; then
+      server6="$(local_server_ipv6s | sort -u || true)"
+      while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        if printf '%s\n' "$server6" | grep -Fxq "$ip"; then matched6=1; break; fi
+      done <<EOF_DNS6_MATCH
+$resolved6
+EOF_DNS6_MATCH
+      if [ "$matched6" -ne 1 ]; then
+        printf '%s: resolved AAAA=%s; local IPv6=%s\n' "$(text le_ipv6_mismatch)" "$(printf '%s' "$resolved6" | tr '\n' ' ')" "$(printf '%s' "$server6" | tr '\n' ' ')" >&2
+        die 'The domain has an AAAA record that does not point to this server. Remove/fix the AAAA record or configure working IPv6 before retrying.'
+      fi
+    fi
+
+    [ -n "$resolved4$resolved6" ] || die "Let’s Encrypt domain has no usable DNS address: $domain"
     info "$(text le_port_check)"
     if command -v ss >/dev/null 2>&1 && ss -H -ltn '( sport = :80 )' 2>/dev/null | grep -q .; then
-      die 'TCP port 80 is already in use; use --letsencrypt-mode webroot or DNS-01 instead'
+      die 'TCP port 80 is already in use; standalone HTTP-01 cannot share it. Use --letsencrypt-mode webroot with an existing web server, or free port 80.'
     fi
   else
     # Webroot works with an existing reverse proxy, CDN, or load balancer. The
@@ -608,8 +669,12 @@ obtain_letsencrypt_certificate() {
   else
     certbot_args+=(--webroot -w "$LE_WEBROOT")
   fi
-  if ! "${certbot_args[@]}"; then
-    die 'Let’s Encrypt certificate request failed. Confirm DNS, TCP 80, and the webroot configuration.'
+  local certbot_log="$INSTALL_DIR/certbot-$(date +%Y%m%d%H%M%S).log"
+  info "$(text le_certbot_log): $certbot_log"
+  if ! "${certbot_args[@]}" 2>&1 | tee "$certbot_log"; then
+    printf '%s\n' '--- Certbot failure tail ---' >&2
+    tail -n 120 "$certbot_log" >&2 || true
+    die 'Let’s Encrypt certificate request failed. The complete Certbot output above is required to diagnose DNS, TCP 80, IPv6, proxy, or rate-limit problems.'
   fi
   [ -s "$cert_dir/fullchain.pem" ] || die "Let’s Encrypt certificate not found: $cert_dir/fullchain.pem"
   [ -s "$cert_dir/privkey.pem" ] || die "Let’s Encrypt private key not found: $cert_dir/privkey.pem"

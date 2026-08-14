@@ -661,3 +661,45 @@ curl -i http://cm.zznb.cc.cd/.well-known/acme-challenge/<探测 token>
 - 安全组、防火墙或 NAT 没有把公网 TCP `80` 转发到实际 Web 服务。
 
 修复并验证 `curl` 返回 `200` 后，直接重新运行原来的安装命令即可。失败时不会创建或启动 SMTP Docker 容器。
+## Let’s Encrypt standalone 申请失败：按这个顺序检查
+
+`standalone` 使用的是 Let’s Encrypt 的 HTTP-01 验证。它不是“只要 A 记录写成服务器 IP 就一定成功”：公网必须能访问该域名的 TCP `80`，而且安装期间 TCP `80` 必须没有被 Nginx、Apache、Caddy 或其他程序占用。HTTP-01 不能改成 `12525`、`8080` 等端口；如果 `80` 已被 Web 服务占用，请改用 `webroot` 并让现有 Web 服务把 `/.well-known/acme-challenge/` 映射到安装脚本填写的目录。
+
+安装脚本现在会在申请前输出：
+
+- 域名的 `A` 和 `AAAA` 解析结果；
+- 本机检测到的 IPv4/IPv6 地址；
+- 私有地址、基准测试地址（例如 `198.18.0.0/15`）和文档保留地址；
+- standalone 是否占用了 TCP `80`；
+- Certbot 的完整输出以及保留在安装目录中的日志文件。
+
+如果看到类似下面的情况：
+
+```text
+A=198.18.3.203
+DNS does not point to this server
+```
+
+说明当前域名并没有解析到你的公网服务器。请在 DNS 控制台把 `A` 记录改成服务器真实公网 IPv4（例如 `38.246.245.105`，以服务器实际地址为准），删除错误的 `AAAA` 记录，或把 `AAAA` 改成服务器真实可用的 IPv6。`198.18.0.0/15` 是保留的网络基准测试地址，不能作为 Let’s Encrypt 公网验证地址。
+
+服务器上可执行以下检查：
+
+```bash
+# DNS：A/AAAA 必须是公网、且指向本机
+getent ahostsv4 cm.zznb.cc.cd
+getent ahostsv6 cm.zznb.cc.cd
+
+# 本机公网地址和 TCP 80 占用情况
+curl -4 https://api.ipify.org; echo
+ip -6 addr show scope global
+ss -lntp | grep ':80' || true
+
+# 如果使用 webroot，挑战文件必须由已有 Web 服务返回 200
+mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
+echo ok > /var/www/letsencrypt/.well-known/acme-challenge/test
+curl -i http://cm.zznb.cc.cd/.well-known/acme-challenge/test
+```
+
+如果服务器使用 Cloudflare：DNS 代理不会替代 HTTP-01 的源站配置。`webroot` 模式下，Cloudflare/反向代理仍必须把挑战 URL 转发到正确的 webroot；SMTP 客户端连接的域名不能依赖普通橙色云代理提供 SMTP TCP 代理。若只是为 SMTP STARTTLS 申请证书，建议使用 DNS-only 的 SMTP 域名，或使用已经正确配置的反向代理/独立 Web 服务完成 HTTP-01。
+
+申请失败时不要只看最后一行 `certificate request failed`，请把安装输出中 `--- Certbot failure tail ---` 之前的具体错误一起保留；常见根因分别是 DNS 不匹配、AAAA 指向错误、TCP `80` 被占用、云安全组/防火墙未放行、NAT 未转发或 Webroot 返回 404。
