@@ -15,3 +15,4 @@ grep -q -- 'Origin CA' "$ROOT/README.md"
 
 echo 'install script webroot/manual certificate checks passed'
 grep -q -- 'validate_certificate_and_key' "$ROOT/install.sh"
+grep -q -- 'if ! apt-get update' "$ROOT/install.sh"

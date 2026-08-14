@@ -72,6 +72,8 @@ text() {
     zh:replace_wizard) printf '现有 config.json 将由配置向导替换。是否继续？[y/N] ' ;; en:replace_wizard) printf 'Existing config.json will be replaced by the configuration wizard. Continue? [y/N] ' ;;
     zh:cancelled) printf '配置替换已取消' ;; en:cancelled) printf 'configuration replacement cancelled' ;;
     zh:not_started) printf 'Cloud Mail 健康检查失败，网关未启动' ;; en:not_started) printf 'Cloud Mail upstream health check failed; the gateway was not started' ;;
+    zh:certbot_apt_update_warning) printf 'APT 软件源更新存在错误；将继续尝试使用现有软件索引安装 certbot。若安装失败，请修复失效的软件源后重试。' ;; en:certbot_apt_update_warning) printf 'APT repository update reported errors; trying to install certbot from the existing package indexes. If installation fails, fix the invalid repository and retry.' ;;
+    zh:certbot_install_failed) printf 'certbot 安装失败。请检查并修复 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 中失效的软件源，然后运行 apt-get update 后重试。' ;; en:certbot_install_failed) printf 'certbot installation failed. Check and fix invalid entries in /etc/apt/sources.list and /etc/apt/sources.list.d/, run apt-get update, then retry.' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -378,9 +380,17 @@ ensure_certbot() {
   if command -v certbot >/dev/null 2>&1; then return; fi
   command -v apt-get >/dev/null 2>&1 || die 'certbot is not installed; install certbot manually on non-Debian systems'
   info 'Installing certbot with apt-get'
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
-  command -v certbot >/dev/null 2>&1 || die 'certbot installation failed'
+  local apt_update_ok=1
+  if ! apt-get update; then
+    apt_update_ok=0
+    printf '%s\n' "$(text certbot_apt_update_warning)" >&2
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y certbot; then
+    printf '%s\n' "$(text certbot_install_failed)" >&2
+    [ "$apt_update_ok" -eq 1 ] || printf '%s\n' 'The preceding apt-get update failed, so repair the reported repository before retrying.' >&2
+    die 'certbot installation failed'
+  fi
+  command -v certbot >/dev/null 2>&1 || die 'certbot installation completed but the certbot command is not available'
 }
 
 install_letsencrypt_hook() {

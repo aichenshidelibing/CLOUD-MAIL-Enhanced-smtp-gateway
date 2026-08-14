@@ -233,6 +233,27 @@ sudo certbot renew --dry-run
 sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/cloud-mail-smtp-gateway
 ```
 
+#### Debian/Ubuntu 的 APT 源错误
+
+如果安装过程中出现类似：
+
+```text
+The repository 'http://deb.debian.org/debian bullseye-backports Release' does not have a Release file.
+```
+
+这不是 SMTP Gateway 或 Let’s Encrypt 验证失败，而是系统 APT 配置中有一个当前不可用的软件源。新版脚本不会因为 `apt-get update` 的单个源失败而立即退出，会继续尝试使用已有的软件索引安装 `certbot`；只有 `certbot` 本身安装失败时才会停止。
+
+如果继续安装仍然失败，请先检查并修复失效源：
+
+```bash
+grep -Rni --color=never 'bullseye-backports\|backports' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
+sudo editor /etc/apt/sources.list
+sudo editor /etc/apt/sources.list.d/<对应文件>.list
+sudo apt-get update
+sudo apt-get install --no-install-recommends -y certbot
+```
+
+只应删除或注释掉报错的那一行，不要为了绕过错误而关闭 APT 签名校验。确认 `certbot --version` 正常后，再重新运行安装脚本即可；脚本会保留已有配置并继续申请证书。
 默认使用 Let’s Encrypt 正式环境。首次调试 DNS 时可先加：
 
 ```bash
