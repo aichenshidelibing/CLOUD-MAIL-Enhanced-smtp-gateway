@@ -192,6 +192,40 @@ server {
 }
 ```
 
+> 如果你的 Web 服务是通过 Docker 运行，宿主机的 `/var/www/letsencrypt` 必须以只读或读写方式挂载到 Web 容器的同一目录；仅在 SMTP 网关容器中创建这个目录不会让 Nginx/Apache/Caddy 看到挑战文件。
+
+Apache 示例：
+
+```apache
+Alias /.well-known/acme-challenge/ /var/www/letsencrypt/.well-known/acme-challenge/
+<Directory /var/www/letsencrypt/.well-known/acme-challenge/>
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
+```
+
+Caddy 示例：
+
+```caddy
+cm.zznb.cc.cd {
+    handle /.well-known/acme-challenge/* {
+        root * /var/www/letsencrypt
+        file_server
+    }
+
+    # 其他站点或反向代理规则放在这里
+}
+```
+
+先确认目录和权限：
+
+```bash
+sudo install -d -m 755 /var/www/letsencrypt/.well-known/acme-challenge
+sudo nginx -t && sudo systemctl reload nginx       # 如果使用 Nginx
+# 或重载 Apache/Caddy
+```
+
 对应的实际文件目录是：
 
 ```text
@@ -543,3 +577,28 @@ sudo ./install.sh --reconfigure --yes
 ## 感谢
 
 感谢 CLOUD-MAIL 原项目作者、社区贡献者、测试人员和所有提供问题反馈的朋友。
+
+#### webroot 返回 404 时如何处理
+
+安装脚本会在创建 Docker 容器之前写入一个临时探测文件，并访问：
+
+```text
+http://你的域名/.well-known/acme-challenge/<探测 token>
+```
+
+脚本现在会自动重试 3 次。若仍返回 `404`，这表示公网 Web 服务已经收到请求，但没有把该 URL 映射到 `--letsencrypt-webroot` 指定的目录，不是 SMTP 网关或 certbot 的连接问题。脚本会输出本地探测文件的完整路径，并保留该文件，便于你修复配置后手工验证：
+
+```bash
+find /var/www/letsencrypt/.well-known/acme-challenge -maxdepth 1 -type f -ls
+curl -i http://cm.zznb.cc.cd/.well-known/acme-challenge/<探测 token>
+```
+
+必须看到 HTTP `200`，响应正文必须与文件内容完全一致。常见原因：
+
+- Nginx 的 `root`/`alias` 指向了其他目录；
+- Nginx/Apache/Caddy 在 Docker 容器内运行，但没有挂载宿主机的 webroot；
+- 当前域名命中了另一个虚拟主机或 CDN/反向代理，挑战路径没有转发到本服务器；
+- Cloudflare DNS 使用代理时，源站的 HTTP 路由仍然必须正确；SMTP 的域名建议使用 DNS only，不能把普通橙色云代理当作 SMTP TCP 代理；
+- 安全组、防火墙或 NAT 没有把公网 TCP `80` 转发到实际 Web 服务。
+
+修复并验证 `curl` 返回 `200` 后，直接重新运行原来的安装命令即可。失败时不会创建或启动 SMTP Docker 容器。

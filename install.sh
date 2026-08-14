@@ -53,6 +53,11 @@ text() {
     zh:le_mode) printf 'Let’s Encrypt 验证模式（standalone/webroot）' ;; en:le_mode) printf 'Let’s Encrypt challenge mode (standalone/webroot)' ;;
     zh:le_webroot) printf 'Let’s Encrypt Webroot 目录' ;; en:le_webroot) printf 'Let’s Encrypt webroot directory' ;;
     zh:le_webroot_check) printf '验证 Webroot 挑战文件可从域名访问' ;; en:le_webroot_check) printf 'Checking that the webroot challenge file is reachable through the domain' ;;
+    zh:webroot_file) printf '本地 Webroot 挑战文件' ;; en:webroot_file) printf 'Local webroot challenge file' ;;
+    zh:webroot_resolved) printf '域名解析到的 IPv4 地址' ;; en:webroot_resolved) printf 'IPv4 addresses resolved for the domain' ;;
+    zh:webroot_response) printf '公网 HTTP 响应摘要' ;; en:webroot_response) printf 'Public HTTP response summary' ;;
+    zh:webroot_file_left) printf '探测文件已保留，便于排查；修复 Web 服务映射后可重新运行安装脚本' ;; en:webroot_file_left) printf 'The probe file was left in place for troubleshooting; rerun the installer after fixing the web-server mapping' ;;
+    zh:webroot_hint) printf '请让现有 Web 服务把 /.well-known/acme-challenge/ 映射到同一个 Webroot；Nginx/Apache/Caddy 配置示例见 README' ;; en:webroot_hint) printf 'Configure the existing web server to map /.well-known/acme-challenge/ to the same webroot; see README for Nginx/Apache/Caddy examples' ;;
     zh:tls_cert_file) printf '已有 TLS 证书文件路径（可留空）' ;; en:tls_cert_file) printf 'Existing TLS certificate path (optional)' ;;
     zh:tls_key_file) printf '已有 TLS 私钥文件路径（可留空）' ;; en:tls_key_file) printf 'Existing TLS private key path (optional)' ;;
     zh:preflight) printf '在创建 Docker 容器前检查 Cloud Mail 连通性' ;; en:preflight) printf 'Checking Cloud Mail connectivity before creating a Docker container' ;;
@@ -314,22 +319,46 @@ local_server_ipv4s() {
   fi
 }
 
+webroot_challenge_diagnostics() {
+  local domain="$1" challenge_file="$2" response_file="$3" http_code="$4" response="$5" resolved response_excerpt
+  resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
+  response_excerpt="$(printf '%s' "$response" | tr '\r\n' '  ' | cut -c1-512)"
+  printf '%s: %s\n' "$(text webroot_file)" "$challenge_file" >&2
+  printf '%s: %s\n' "$(text webroot_resolved)" "${resolved:-unknown}" >&2
+  printf '%s: HTTP %s%s\n' "$(text webroot_response)" "$http_code" "${response_excerpt:+ - $response_excerpt}" >&2
+  printf '%s\n' "$(text webroot_hint)" >&2
+  printf '%s\n' "$(text webroot_file_left): $challenge_file" >&2
+}
+
 check_webroot_prerequisites() {
-  local domain="$1" challenge_dir token challenge_file expected response response_file http_code
+  local domain="$1" challenge_dir token challenge_file expected response response_file http_code curl_attempt
   command -v curl >/dev/null 2>&1 || die 'curl is required for the webroot challenge check'
+  command -v getent >/dev/null 2>&1 || die 'getent is required for the webroot challenge diagnostics'
   challenge_dir="$LE_WEBROOT/.well-known/acme-challenge"
-  mkdir -p "$challenge_dir"
+  mkdir -p "$challenge_dir" || die "could not create Let’s Encrypt webroot challenge directory: $challenge_dir"
+  [ -d "$challenge_dir" ] || die "Let’s Encrypt webroot challenge path is not a directory: $challenge_dir"
   chmod 755 "$LE_WEBROOT" "$LE_WEBROOT/.well-known" "$challenge_dir" 2>/dev/null || true
   token="cloud-mail-smtp-gateway-$(date +%s)-$$"
   challenge_file="$challenge_dir/$token"
   expected="cloud-mail-smtp-gateway-webroot-check"
-  printf '%s' "$expected" > "$challenge_file"
+  printf '%s' "$expected" > "$challenge_file" || die "could not write webroot challenge file: $challenge_file"
   info "$(text le_webroot_check): http://$domain/.well-known/acme-challenge/$token"
   response_file="$(mktemp)"
-  http_code="$(curl --silent --show-error --location --insecure --connect-timeout 10 --max-time 20 --output "$response_file" --write-out '%{http_code}' "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)"
-  response="$(cat "$response_file" 2>/dev/null || true)"
-  rm -f -- "$challenge_file" "$response_file"
-  [ "$http_code" = 200 ] && [ "$response" = "$expected" ] || die "webroot challenge is not reachable at http://$domain/.well-known/acme-challenge/ (HTTP $http_code)"
+  http_code='000'
+  response=''
+  for curl_attempt in 1 2 3; do
+    : > "$response_file"
+    http_code="$(curl --ipv4 --silent --show-error --location --insecure --connect-timeout 10 --max-time 20 --output "$response_file" --write-out '%{http_code}' "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+    response="$(cat "$response_file" 2>/dev/null || true)"
+    if [ "$http_code" = 200 ] && [ "$response" = "$expected" ]; then
+      rm -f -- "$challenge_file" "$response_file"
+      return 0
+    fi
+    [ "$curl_attempt" -lt 3 ] && sleep 1
+  done
+  webroot_challenge_diagnostics "$domain" "$challenge_file" "$response_file" "$http_code" "$response"
+  rm -f -- "$response_file"
+  die "webroot challenge is not reachable at http://$domain/.well-known/acme-challenge/ (HTTP $http_code)"
 }
 
 check_letsencrypt_prerequisites() {

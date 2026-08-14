@@ -10,6 +10,9 @@ grep -q -- 'CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT' <<<"$HELP_OUTPUT"
 
 grep -q -- 'certbot_args+=(--webroot -w "$LE_WEBROOT")' "$ROOT/install.sh"
 grep -q -- 'check_webroot_prerequisites' "$ROOT/install.sh"
+grep -q -- 'webroot_challenge_diagnostics' "$ROOT/install.sh"
+grep -q -- 'webroot_file_left' "$ROOT/install.sh"
+grep -q -- 'curl_attempt' "$ROOT/install.sh"
 grep -q -- 'CLOUD_MAIL_SMTP_TLS_CERT_FILE' "$ROOT/README.md"
 grep -q -- 'Origin CA' "$ROOT/README.md"
 
