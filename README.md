@@ -275,7 +275,7 @@ sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/cloud-mail-smtp-gateway
 The repository 'http://deb.debian.org/debian bullseye-backports Release' does not have a Release file.
 ```
 
-这不是 SMTP Gateway 或 Let’s Encrypt 验证失败，而是系统 APT 配置中有一个当前不可用的软件源。新版脚本不会因为 `apt-get update` 的单个源失败而立即退出，会继续尝试使用已有的软件索引安装 `certbot`；只有 `certbot` 本身安装失败时才会停止。
+这不是 SMTP Gateway 或 Let’s Encrypt 验证失败，而是系统 APT 配置中有一个当前不可用的软件源。新版脚本不会关闭 APT 签名校验或绕过失效软件源；`apt-get update` 失败时会输出排查信息并停止，修复软件源后再重试。
 
 如果继续安装仍然失败，请先检查并修复失效源：
 
@@ -295,6 +295,65 @@ CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING=1
 ```
 
 SMTP 客户端设置：`smtp.example.com` + 宿主机映射端口（如 `12525`）+ **普通 SMTP/STARTTLS**，不要选择 SMTPS/SSL 465。加入共享 Docker 网络的业务容器也可使用证书域名和容器端口 `2525`；未启用公网证书时才使用 `smtp-gateway:2525` 并导入自签名 CA。
+### 4.0 自动检测并安装依赖（Debian/Ubuntu 推荐）
+
+安装脚本现在会在创建任何网关 Docker 容器之前检查运行环境。推荐在全新的 Debian 或 Ubuntu 服务器上以 `root` 或 `sudo` 执行：
+
+```bash
+chmod +x install.sh
+sudo ./install.sh --language zh
+# English interface:
+sudo ./install.sh --language en
+```
+
+默认行为（`CLOUD_MAIL_SMTP_AUTO_INSTALL=1`）如下：
+
+1. 检测 Debian/Ubuntu 发行版、版本代号和 CPU 架构；
+2. 使用系统 APT 和 Docker 官方签名 APT 源安装 Docker Engine、Buildx 与 Docker Compose v2 Plugin；
+3. 检查并按需安装 `curl`、`openssl`、`getent`、`hostname`、`ss`、`awk` 等基础命令；
+4. 启动 Docker 服务并设置开机自启（systemd 环境）；
+5. 使用 `docker version` 和 `docker compose version` 验证 Docker daemon 与 Compose v2；
+6. 只有选择 Let’s Encrypt 时才安装 `certbot`。
+
+脚本不会使用 `curl | sh`、`apt-key` 或 `--allow-unauthenticated`，也不会自动删除、注释已有 APT 软件源或关闭签名校验。APT 更新失败时会停止安装，不会创建或启动网关容器。
+
+如果服务器已经由运维系统统一安装依赖，可以关闭自动安装，仅做检查：
+
+```bash
+sudo ./install.sh --no-auto-install
+# 或
+sudo CLOUD_MAIL_SMTP_AUTO_INSTALL=0 ./install.sh
+```
+
+`--no-auto-install` 模式仍要求以下命令可用：
+
+```text
+curl openssl getent hostname ss awk sort tr cut install mktemp sed grep
+Docker Engine + docker compose（Compose v2）
+```
+
+安装脚本只对 Debian/Ubuntu 提供自动 APT 配置。其他 Linux 发行版请先按照发行版文档手动安装 Docker Engine、Docker Compose v2 和基础命令，然后使用 `--no-auto-install`；若脚本检测到非 Debian/Ubuntu，会显示发行版信息并安全退出，不会修改软件源。
+
+#### APT 软件源错误排查
+
+如果出现 `bullseye-backports`、`does not have a Release file` 或其他 `apt-get update` 错误，先定位失效配置：
+
+```bash
+grep -Rni --color=never \
+  'bullseye-backports\|backports' \
+  /etc/apt/sources.list \
+  /etc/apt/sources.list.d 2>/dev/null || true
+```
+
+请根据 APT 输出修复对应的软件源，确认下面命令成功后，再重新运行安装脚本：
+
+```bash
+sudo apt-get update
+sudo apt-get install --no-install-recommends -y \
+  curl ca-certificates gnupg openssl libc-bin hostname iproute2 gawk coreutils util-linux
+```
+
+不要为了绕过错误使用 `--allow-unauthenticated`，也不要随意删除整个 `/etc/apt/sources.list.d/` 目录。
 ## 4. 安装
 
 仅支持 Linux + Docker Compose v2，不提供 Windows 安装程序。

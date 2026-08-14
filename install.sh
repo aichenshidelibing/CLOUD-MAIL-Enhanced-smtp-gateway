@@ -19,6 +19,10 @@ LE_EMAIL="${CLOUD_MAIL_SMTP_LETSENCRYPT_EMAIL:-}"
 LE_STAGING="${CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING:-0}"
 LE_MODE="${CLOUD_MAIL_SMTP_LETSENCRYPT_MODE:-standalone}"
 LE_WEBROOT="${CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT:-/var/www/letsencrypt}"
+AUTO_INSTALL_DEPENDENCIES="${CLOUD_MAIL_SMTP_AUTO_INSTALL:-1}"
+DISTRO_ID=""
+DISTRO_VERSION_ID=""
+DISTRO_CODENAME=""
 [ -n "${CLOUD_MAIL_LANGUAGE:-}" ] && LANGUAGE_EXPLICIT=1
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
@@ -79,6 +83,15 @@ text() {
     zh:not_started) printf 'Cloud Mail 健康检查失败，网关未启动' ;; en:not_started) printf 'Cloud Mail upstream health check failed; the gateway was not started' ;;
     zh:certbot_apt_update_warning) printf 'APT 软件源更新存在错误；将继续尝试使用现有软件索引安装 certbot。若安装失败，请修复失效的软件源后重试。' ;; en:certbot_apt_update_warning) printf 'APT repository update reported errors; trying to install certbot from the existing package indexes. If installation fails, fix the invalid repository and retry.' ;;
     zh:certbot_install_failed) printf 'certbot 安装失败。请检查并修复 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 中失效的软件源，然后运行 apt-get update 后重试。' ;; en:certbot_install_failed) printf 'certbot installation failed. Check and fix invalid entries in /etc/apt/sources.list and /etc/apt/sources.list.d/, run apt-get update, then retry.' ;;
+    zh:dependency_check) printf '检查系统运行依赖' ;; en:dependency_check) printf 'Checking runtime dependencies' ;;
+    zh:dependency_install) printf '安装缺失的软件包' ;; en:dependency_install) printf 'Installing missing packages' ;;
+    zh:docker_setup) printf '准备 Docker Engine 和 Compose v2' ;; en:docker_setup) printf 'Preparing Docker Engine and Compose v2' ;;
+    zh:docker_start) printf '启动 Docker 服务并设置开机自启' ;; en:docker_start) printf 'Starting Docker and enabling it at boot' ;;
+    zh:apt_update_failed) printf 'APT 软件源更新失败。脚本不会关闭签名校验、删除或注释已有软件源。请先修复报错的软件源后重试。' ;; en:apt_update_failed) printf 'APT repository update failed. The installer will not disable signature verification or delete/comment existing sources; repair the reported source and retry.' ;;
+    zh:apt_install_failed) printf 'APT 软件包安装失败' ;; en:apt_install_failed) printf 'APT package installation failed' ;;
+    zh:non_debian) printf '当前系统不是受支持的 Debian/Ubuntu。请手动安装依赖后再使用本项目，安装脚本将安全退出。' ;; en:non_debian) printf 'This is not a supported Debian/Ubuntu system. Install the dependencies manually and rerun the project; the installer will exit safely.' ;;
+    zh:manual_dependencies) printf '手动依赖：curl openssl libc-bin hostname iproute2 gawk coreutils util-linux，以及 Docker Engine 和 Docker Compose v2。' ;; en:manual_dependencies) printf 'Manual dependencies: curl, openssl, libc-bin, hostname, iproute2, gawk, coreutils, util-linux, Docker Engine, and Docker Compose v2.' ;;
+    zh:docker_unavailable) printf 'Docker daemon 或 Compose v2 不可用，请检查 Docker 服务和当前用户权限。' ;; en:docker_unavailable) printf 'Docker daemon or Compose v2 is unavailable; check the Docker service and current user permissions.' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -98,6 +111,7 @@ Options:
   --language LANG       Interface language: zh or en (default: zh)
   --lang LANG           Alias for --language
   --yes                 Do not ask before replacing an existing config.json
+  --no-auto-install     Do not install missing system dependencies; validate only
   --domain DOMAIN       Let’s Encrypt SMTP certificate domain
   --letsencrypt         Enable Let’s Encrypt certificate issuance
   --letsencrypt-email E Email address for Let’s Encrypt notices
@@ -133,6 +147,7 @@ Environment variables for --non-interactive:
   CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING (1 to use the Let's Encrypt staging CA)
   CLOUD_MAIL_SMTP_LETSENCRYPT_MODE (standalone or webroot; default: standalone)
   CLOUD_MAIL_SMTP_LETSENCRYPT_WEBROOT (default: /var/www/letsencrypt)
+  CLOUD_MAIL_SMTP_AUTO_INSTALL (1 to install missing Debian/Ubuntu dependencies; default: 1)
 
 Legacy compatibility variables:
   CLOUD_MAIL_UPSTREAM_URL
@@ -390,6 +405,147 @@ EOF_DNS
   fi
 }
 
+detect_linux_distribution() {
+  [ -r /etc/os-release ] || die "$(text non_debian) /etc/os-release is missing. $(text manual_dependencies)"
+  # /etc/os-release is the standard shell-compatible distribution metadata file.
+  . /etc/os-release
+  DISTRO_ID="${ID:-}"
+  DISTRO_VERSION_ID="${VERSION_ID:-}"
+  DISTRO_CODENAME="${VERSION_CODENAME:-}"
+  if [ -z "$DISTRO_CODENAME" ] && command -v lsb_release >/dev/null 2>&1; then
+    DISTRO_CODENAME="$(lsb_release -sc 2>/dev/null || true)"
+  fi
+  case "$DISTRO_ID" in
+    debian|ubuntu) ;;
+    *)
+      printf '%s: id=%s version=%s codename=%s\n' "$(text non_debian)" "${DISTRO_ID:-unknown}" "${DISTRO_VERSION_ID:-unknown}" "${DISTRO_CODENAME:-unknown}" >&2
+      printf '%s\n' "$(text manual_dependencies)" >&2
+      die 'unsupported Linux distribution'
+      ;;
+  esac
+  [ -n "$DISTRO_CODENAME" ] || die 'could not determine the Debian/Ubuntu release codename; set up the Docker repository manually and rerun with --no-auto-install'
+}
+
+apt_install_packages() {
+  local packages=("$@")
+  [ "${#packages[@]}" -gt 0 ] || return 0
+  command -v apt-get >/dev/null 2>&1 || die 'apt-get is required on Debian/Ubuntu'
+  info "$(text dependency_install): ${packages[*]}"
+  if ! apt-get update; then
+    printf '%s\n' "$(text apt_update_failed)" >&2
+    grep -Rni --color=never 'bullseye-backports\|backports' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true
+    printf '%s\n' 'Inspect all configured files under /etc/apt/sources.list and /etc/apt/sources.list.d/, repair the reported entry, then run apt-get update.' >&2
+    die 'apt-get update failed'
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "${packages[@]}"; then
+    printf '%s\n' "$(text apt_install_failed): ${packages[*]}" >&2
+    die 'required dependency installation failed'
+  fi
+}
+
+ensure_base_commands() {
+  local missing_packages=() command_name
+  command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+  command -v update-ca-certificates >/dev/null 2>&1 || missing_packages+=(ca-certificates)
+  command -v gpg >/dev/null 2>&1 || command -v gpgv >/dev/null 2>&1 || missing_packages+=(gnupg)
+  command -v openssl >/dev/null 2>&1 || missing_packages+=(openssl)
+  command -v getent >/dev/null 2>&1 || missing_packages+=(libc-bin)
+  command -v hostname >/dev/null 2>&1 || missing_packages+=(hostname)
+  command -v ss >/dev/null 2>&1 || missing_packages+=(iproute2)
+  command -v awk >/dev/null 2>&1 || missing_packages+=(gawk)
+  for command_name in sort tr cut install; do
+    command -v "$command_name" >/dev/null 2>&1 || missing_packages+=(coreutils)
+  done
+  command -v mktemp >/dev/null 2>&1 || missing_packages+=(util-linux)
+  command -v sed >/dev/null 2>&1 || missing_packages+=(sed)
+  command -v grep >/dev/null 2>&1 || missing_packages+=(grep)
+  if [ "${#missing_packages[@]}" -gt 0 ]; then
+    # Keep package names unique without relying on sort, which may be missing.
+    local unique_packages=() package seen
+    for package in "${missing_packages[@]}"; do
+      seen=0
+      for command_name in "${unique_packages[@]}"; do [ "$command_name" = "$package" ] && seen=1 && break; done
+      [ "$seen" -eq 0 ] && unique_packages+=("$package")
+    done
+    apt_install_packages "${unique_packages[@]}"
+  fi
+}
+
+ensure_docker_repository() {
+  local architecture repository key_dir='/etc/apt/keyrings' key_file='/etc/apt/keyrings/docker.asc' source_file='/etc/apt/sources.list.d/docker.list' source_line key_tmp source_tmp
+  command -v curl >/dev/null 2>&1 || die 'curl is required to configure the Docker official APT repository'
+  architecture="$(dpkg --print-architecture 2>/dev/null || true)"
+  [ -n "$architecture" ] || die 'could not determine the Debian package architecture'
+  mkdir -p "$key_dir"
+  key_tmp="$(mktemp)"
+  if ! curl --fail --silent --show-error --location "https://download.docker.com/linux/$DISTRO_ID/gpg" --output "$key_tmp"; then
+    rm -f -- "$key_tmp"
+    die 'could not download the Docker official APT signing key'
+  fi
+  install -m 0644 "$key_tmp" "$key_file"
+  rm -f -- "$key_tmp"
+  repository="https://download.docker.com/linux/$DISTRO_ID"
+  source_line="deb [arch=$architecture signed-by=$key_file] $repository $DISTRO_CODENAME stable"
+  source_tmp="$(mktemp)"
+  printf '%s\n' "$source_line" > "$source_tmp"
+  install -m 0644 "$source_tmp" "$source_file"
+  rm -f -- "$source_tmp"
+}
+
+ensure_docker_service() {
+  if docker version >/dev/null 2>&1; then return 0; fi
+  info "$(text docker_start)"
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl enable --now docker || die "$(text docker_unavailable)"
+  elif command -v service >/dev/null 2>&1; then
+    service docker start >/dev/null 2>&1 || true
+    printf '%s\n' 'systemd is not active; Docker was started if the service supports it, but boot-time enablement must be configured manually.' >&2
+  else
+    die "$(text docker_unavailable)"
+  fi
+}
+
+validate_docker_runtime() {
+  command -v docker >/dev/null 2>&1 || die 'Docker CLI is not installed or not in PATH'
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 plugin is not installed (docker compose)'
+  docker version >/dev/null 2>&1 || die "$(text docker_unavailable)"
+}
+
+validate_required_commands() {
+  local command_name
+  for command_name in curl openssl getent hostname ss awk sort tr cut install mktemp sed grep docker; do
+    command -v "$command_name" >/dev/null 2>&1 || die "missing required command: $command_name. $(text manual_dependencies)"
+  done
+  validate_docker_runtime
+}
+
+ensure_docker_runtime() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    ensure_docker_service
+    validate_docker_runtime
+    return 0
+  fi
+  info "$(text docker_setup)"
+  ensure_docker_repository
+  apt_install_packages docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  ensure_docker_service
+  validate_docker_runtime
+}
+
+ensure_runtime_dependencies() {
+  detect_linux_distribution
+  info "$(text dependency_check): $DISTRO_ID ${DISTRO_VERSION_ID:-unknown} (${DISTRO_CODENAME:-unknown})"
+  case "$AUTO_INSTALL_DEPENDENCIES" in
+    1)
+      ensure_base_commands
+      ensure_docker_runtime
+      ;;
+    0)
+      validate_required_commands
+      ;;
+    *) die 'CLOUD_MAIL_SMTP_AUTO_INSTALL must be 0 or 1' ;;
+  esac
+}
 ensure_renewal_scheduler() {
   local cron_file='/etc/cron.d/cloud-mail-smtp-gateway-certbot'
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files certbot.timer >/dev/null 2>&1 && systemctl cat certbot.timer >/dev/null 2>&1; then
@@ -407,18 +563,10 @@ CRON
 
 ensure_certbot() {
   if command -v certbot >/dev/null 2>&1; then return; fi
+  [ "$AUTO_INSTALL_DEPENDENCIES" -eq 1 ] || die 'certbot is not installed; install certbot manually or remove --no-auto-install'
   command -v apt-get >/dev/null 2>&1 || die 'certbot is not installed; install certbot manually on non-Debian systems'
   info 'Installing certbot with apt-get'
-  local apt_update_ok=1
-  if ! apt-get update; then
-    apt_update_ok=0
-    printf '%s\n' "$(text certbot_apt_update_warning)" >&2
-  fi
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y certbot; then
-    printf '%s\n' "$(text certbot_install_failed)" >&2
-    [ "$apt_update_ok" -eq 1 ] || printf '%s\n' 'The preceding apt-get update failed, so repair the reported repository before retrying.' >&2
-    die 'certbot installation failed'
-  fi
+  apt_install_packages certbot
   command -v certbot >/dev/null 2>&1 || die 'certbot installation completed but the certbot command is not available'
 }
 
@@ -641,6 +789,7 @@ while [ "$#" -gt 0 ]; do
     --letsencrypt-email) [ "$#" -ge 2 ] || die '--letsencrypt-email requires an email address'; LE_EMAIL="$2"; shift 2 ;;
     --letsencrypt-staging) LE_STAGING=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
+    --no-auto-install) AUTO_INSTALL_DEPENDENCIES=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (use --help for usage)" ;;
   esac
@@ -649,15 +798,15 @@ done
 set_language "$UI_LANGUAGE"
 case "$LE_ENABLED" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_LETSENCRYPT must be 0 or 1' ;; esac
 case "$LE_STAGING" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_LETSENCRYPT_STAGING must be 0 or 1' ;; esac
+case "$AUTO_INSTALL_DEPENDENCIES" in 0|1) ;; *) die 'CLOUD_MAIL_SMTP_AUTO_INSTALL must be 0 or 1' ;; esac
 validate_letsencrypt_mode
 if [ -n "$TLS_DOMAIN" ]; then TLS_HOSTNAME="$TLS_DOMAIN"; fi
 [ "$NON_INTERACTIVE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --non-interactive cannot be used together'
 [ "$RECONFIGURE" -eq 0 ] || [ -z "$CONFIG_SOURCE" ] || die '--config and --reconfigure cannot be used together'
 [ "$(uname -s)" = 'Linux' ] || die 'This installer supports Linux only'
 [ "$(id -u)" -eq 0 ] || die 'Run this installer as root (for example: sudo ./install.sh)'
+ensure_runtime_dependencies
 for required in Dockerfile docker-compose.yml package.json config.example.json src; do [ -e "$SCRIPT_DIR/$required" ] || die "installer package is incomplete: missing $required"; done
-command -v docker >/dev/null 2>&1 || die 'Docker Engine is not installed or docker is not in PATH'
-docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required (docker compose)'
 case "$INSTALL_DIR" in /*) ;; *) die 'installation directory must be an absolute path' ;; esac
 if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then die "installation path exists but is not a directory: $INSTALL_DIR"; fi
 
